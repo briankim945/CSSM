@@ -29,10 +29,12 @@ class StandardCSSM(nn.Module):
         dense_mixing: If True, use multi-head parameter sharing (more efficient).
                      If False, use fully independent depthwise kernels.
         kernel_size: Spatial kernel size (square)
+        concat_xy: Unused (for API compatibility with GatedOpponentCSSM)
     """
     channels: int
     dense_mixing: bool = False
     kernel_size: int = 15
+    concat_xy: bool = True  # Unused, for API compatibility
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -95,11 +97,15 @@ class StandardCSSM(nn.Module):
             k_padded = k_spatial[:, start_h:start_h+H, start_w:start_w+W]
 
         # RFFT over spatial dims (axes 1, 2 of kernel -> H, W)
-        K_hat = jnp.fft.rfft2(k_padded, axes=(1, 2))  # (C, H, W_freq)
+        K_hat_raw = jnp.fft.rfft2(k_padded, axes=(1, 2))  # (C, H, W_freq)
+        # Clip spectral coefficients to prevent log-space explosion
+        K_hat = jnp.clip(K_hat_raw.real, -10.0, 10.0) + 1j * jnp.clip(K_hat_raw.imag, -10.0, 10.0)
 
         # Reshape input for FFT: (B, T, H, W, C) -> (B, T, C, H, W)
         x_perm = x.transpose(0, 1, 4, 2, 3)
-        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
+        U_hat_raw = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
+        # Clip input spectral coefficients to prevent log-space explosion
+        U_hat = jnp.clip(U_hat_raw.real, -10.0, 10.0) + 1j * jnp.clip(U_hat_raw.imag, -10.0, 10.0)
 
         # --- 3. Cepstral Scan ---
         # Convert to GOOM representation (numerically stable log-space)
@@ -137,10 +143,12 @@ class GatedOpponentCSSM(nn.Module):
         channels: Number of input/output channels
         dense_mixing: If True, use multi-head parameter sharing
         kernel_size: Spatial kernel size for excitation/inhibition kernels
+        concat_xy: If True, concat [X,Y] and project to C channels
     """
     channels: int
     dense_mixing: bool = False
-    kernel_size: int = 15
+    kernel_size: int = 11
+    concat_xy: bool = True
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -195,8 +203,11 @@ class GatedOpponentCSSM(nn.Module):
                 mode='constant'
             )
 
-        K_E_spec = jnp.fft.rfft2(pad_kernel(k_exc), axes=(1, 2))  # (C, H, W_f)
-        K_I_spec = jnp.fft.rfft2(pad_kernel(k_inh), axes=(1, 2))
+        K_E_raw = jnp.fft.rfft2(pad_kernel(k_exc), axes=(1, 2))  # (C, H, W_f)
+        K_I_raw = jnp.fft.rfft2(pad_kernel(k_inh), axes=(1, 2))
+        # Clip spectral coefficients to prevent log-space explosion
+        K_E_spec = jnp.clip(K_E_raw.real, -10.0, 10.0) + 1j * jnp.clip(K_E_raw.imag, -10.0, 10.0)
+        K_I_spec = jnp.clip(K_I_raw.real, -10.0, 10.0) + 1j * jnp.clip(K_I_raw.imag, -10.0, 10.0)
 
         # --- 4. Build Transition Matrix ---
         # Target shape: (B, T, C, H, W_f, 2, 2)
@@ -237,7 +248,9 @@ class GatedOpponentCSSM(nn.Module):
         # --- 5. Input Vector ---
         # FFT the input
         x_perm = x.transpose(0, 1, 4, 2, 3)  # (B, T, C, H, W)
-        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_f)
+        U_hat_raw = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_f)
+        # Clip input spectral coefficients to prevent log-space explosion
+        U_hat = jnp.clip(U_hat_raw.real, -10.0, 10.0) + 1j * jnp.clip(U_hat_raw.imag, -10.0, 10.0)
 
         # Input drives X channel (index 0), Y channel gets zero input
         # log(0) = -inf is fine because exp(-inf) = 0 in the LSE
@@ -256,6 +269,16 @@ class GatedOpponentCSSM(nn.Module):
         Y_log = State_log[..., 1]
         Y_hat = from_goom(Y_log)
         y_out = jnp.fft.irfft2(Y_hat, s=(H, W), axes=(3, 4))
+        y_out = y_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
 
-        # Back to (B, T, H, W, C)
-        return y_out.transpose(0, 1, 3, 4, 2)
+        if self.concat_xy:
+            # Also extract X channel, concat [X, Y], project to C
+            X_log = State_log[..., 0]
+            X_hat = from_goom(X_log)
+            x_out = jnp.fft.irfft2(X_hat, s=(H, W), axes=(3, 4))
+            x_out = x_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+
+            xy_concat = jnp.concatenate([x_out, y_out], axis=-1)  # (B, T, H, W, 2C)
+            return nn.Dense(C, name='output_proj')(xy_concat)
+        else:
+            return y_out

@@ -1,7 +1,11 @@
 """
-Main training script for CSSM ConvNeXt models.
+Main training script for CSSM models.
 
-Supports all 8 model variants with:
+Supports two architectures:
+- ConvNeXt-style: Pure/Hybrid CSSM blocks with ConvNeXt structure
+- ViT-style: Clean pre-norm transformer blocks with CSSM replacing attention
+
+Training features:
 - Cosine learning rate scheduling
 - Gradient clipping
 - Validation evaluation
@@ -24,6 +28,7 @@ from tqdm import tqdm
 import orbax.checkpoint as ocp
 
 from src.models.convnext import ModelFactory
+from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
 from src.data import get_imagenette_video_loader, get_dataset_info
 
 
@@ -208,15 +213,31 @@ def evaluate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train CSSM ConvNeXt models')
+    parser = argparse.ArgumentParser(description='Train CSSM models')
 
-    # Model configuration
-    parser.add_argument('--mode', type=str, choices=['pure', 'hybrid'], required=True,
-                        help='Model mode: pure (CSSM replaces conv) or hybrid (ConvNeXt + CSSM)')
-    parser.add_argument('--cssm', type=str, choices=['standard', 'opponent'], required=True,
+    # Architecture selection
+    parser.add_argument('--arch', type=str, choices=['convnext', 'vit'], default='convnext',
+                        help='Architecture: convnext (ConvNeXt-style) or vit (ViT-style pre-norm)')
+
+    # Model configuration (ConvNeXt-style)
+    parser.add_argument('--mode', type=str, choices=['pure', 'hybrid'], default='pure',
+                        help='[convnext] Model mode: pure (CSSM replaces conv) or hybrid')
+    parser.add_argument('--cssm', type=str, choices=['standard', 'opponent'], default='opponent',
                         help='CSSM type: standard or opponent (gated)')
-    parser.add_argument('--mixing', type=str, choices=['dense', 'depthwise'], required=True,
+    parser.add_argument('--mixing', type=str, choices=['dense', 'depthwise'], default='depthwise',
                         help='Mixing type: dense (multi-head) or depthwise')
+    parser.add_argument('--no_concat_xy', action='store_true',
+                        help='Disable [X,Y] concat+project in GatedOpponentCSSM')
+
+    # Model configuration (ViT-style)
+    parser.add_argument('--embed_dim', type=int, default=384,
+                        help='[vit] Embedding dimension (192=tiny, 384=small, 768=base)')
+    parser.add_argument('--depth', type=int, default=12,
+                        help='[vit] Number of transformer blocks')
+    parser.add_argument('--patch_size', type=int, default=16,
+                        help='[vit] Patch size for stem')
+    parser.add_argument('--no_pos_embed', action='store_true',
+                        help='[vit] Disable position embeddings')
 
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=8,
@@ -258,9 +279,13 @@ def main():
     args = parser.parse_args()
 
     # Generate run name from config
-    run_name = f"{args.mode}_{args.cssm}_{args.mixing}"
+    if args.arch == 'vit':
+        run_name = f"vit_{args.cssm}_d{args.depth}_e{args.embed_dim}"
+    else:
+        run_name = f"{args.mode}_{args.cssm}_{args.mixing}"
     print(f"\n{'='*60}")
     print(f"Running Configuration: {run_name}")
+    print(f"Architecture: {args.arch.upper()}")
     print(f"{'='*60}\n")
 
     # Initialize wandb
@@ -289,13 +314,26 @@ def main():
     print(f"  Steps per epoch: {steps_per_epoch}")
     print(f"  Total steps: {total_steps}\n")
 
-    # Create model
-    model = ModelFactory(
-        mode=args.mode,
-        cssm_type=args.cssm,
-        mixing=args.mixing,
-        num_classes=num_classes,
-    )
+    # Create model based on architecture
+    if args.arch == 'vit':
+        model = CSSMViT(
+            num_classes=num_classes,
+            embed_dim=args.embed_dim,
+            depth=args.depth,
+            patch_size=args.patch_size,
+            cssm_type=args.cssm,
+            dense_mixing=(args.mixing == 'dense'),
+            concat_xy=not args.no_concat_xy,
+            use_pos_embed=not args.no_pos_embed,
+        )
+    else:
+        model = ModelFactory(
+            mode=args.mode,
+            cssm_type=args.cssm,
+            mixing=args.mixing,
+            num_classes=num_classes,
+            concat_xy=not args.no_concat_xy,
+        )
 
     # Initialize training state
     state, _ = create_train_state(

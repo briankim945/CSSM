@@ -108,12 +108,14 @@ class CSSMNextBlock(nn.Module):
         dim: Number of channels
         cssm_cls: CSSM class to use (StandardCSSM or GatedOpponentCSSM)
         dense_mixing: Whether CSSM should use dense (multi-head) mixing
+        concat_xy: Whether to concat [X,Y] and project (GatedOpponentCSSM only)
         drop_path: Drop path probability
         layer_scale_init_value: Initial value for layer scale
     """
     dim: int
     cssm_cls: Type[nn.Module]
     dense_mixing: bool = False
+    concat_xy: bool = True
     drop_path: float = 0.0
     layer_scale_init_value: float = 1e-6
 
@@ -121,22 +123,25 @@ class CSSMNextBlock(nn.Module):
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
         shortcut = x
 
-        # 1. CSSM (Time-Varying Spatial Mixing)
+        # 1. Pre-norm for CSSM stability (CSSM has unbounded log-space ops)
+        x = nn.LayerNorm(name='pre_norm')(x)
+
+        # 2. CSSM (Time-Varying Spatial Mixing)
         x = self.cssm_cls(
             channels=self.dim,
             dense_mixing=self.dense_mixing,
+            concat_xy=self.concat_xy,
             name='cssm'
         )(x)
-        x = nn.LayerNorm(name='norm')(x)  # Norm AFTER CSSM
 
-        # 2. Pointwise Expansion
+        # 3. Pointwise Expansion
         x = nn.Dense(4 * self.dim, name='pwconv1')(x)
         x = nn.gelu(x)
 
-        # 3. Pointwise Projection
+        # 4. Pointwise Projection
         x = nn.Dense(self.dim, name='pwconv2')(x)
 
-        # 4. Layer Scale
+        # 5. Layer Scale
         gamma = self.param(
             'gamma',
             lambda key, shape: self.layer_scale_init_value * jnp.ones(shape),
@@ -144,7 +149,7 @@ class CSSMNextBlock(nn.Module):
         )
         x = x * gamma
 
-        # 5. DropPath + Residual
+        # 6. DropPath + Residual
         x = DropPath(self.drop_path)(x, deterministic=not training)
         return shortcut + x
 
@@ -162,11 +167,13 @@ class HybridBlock(nn.Module):
         dim: Number of channels
         cssm_cls: CSSM class to use
         dense_mixing: Whether CSSM should use dense mixing
+        concat_xy: Whether to concat [X,Y] and project (GatedOpponentCSSM only)
         drop_path: Drop path probability
     """
     dim: int
     cssm_cls: Type[nn.Module]
     dense_mixing: bool = False
+    concat_xy: bool = True
     drop_path: float = 0.0
 
     @nn.compact
@@ -186,6 +193,7 @@ class HybridBlock(nn.Module):
         y = self.cssm_cls(
             channels=self.dim,
             dense_mixing=self.dense_mixing,
+            concat_xy=self.concat_xy,
             name='cssm'
         )(y)
         y = nn.LayerNorm(name='post_norm')(y)  # Post-Norm
@@ -217,6 +225,7 @@ class ModelFactory(nn.Module):
         num_classes: Number of output classes
         depths: Number of blocks per stage (default: [1, 1, 1, 1])
         drop_path_rate: Maximum drop path rate (linearly increases)
+        concat_xy: Whether to concat [X,Y] and project (GatedOpponentCSSM only)
     """
     mode: str
     cssm_type: str
@@ -224,6 +233,7 @@ class ModelFactory(nn.Module):
     num_classes: int = 10
     depths: tuple = (1, 1, 1, 1)
     drop_path_rate: float = 0.1
+    concat_xy: bool = True
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
@@ -288,6 +298,7 @@ class ModelFactory(nn.Module):
                         dim=dim,
                         cssm_cls=CSSM,
                         dense_mixing=dense,
+                        concat_xy=self.concat_xy,
                         drop_path=dp_rate,
                         name=f'stage{stage_idx}_block{block_idx_in_stage}'
                     )(x, training=training)
@@ -296,6 +307,7 @@ class ModelFactory(nn.Module):
                         dim=dim,
                         cssm_cls=CSSM,
                         dense_mixing=dense,
+                        concat_xy=self.concat_xy,
                         drop_path=dp_rate,
                         name=f'stage{stage_idx}_block{block_idx_in_stage}'
                     )(x, training=training)
