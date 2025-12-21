@@ -121,10 +121,17 @@ def goom_log_fwd(x: jax.Array):
 
 
 def goom_log_bwd(x: jax.Array, g: jax.Array):
-    """Backward pass for goom_log with epsilon for stability."""
-    eps = jnp.finfo(x.real.dtype).eps
-    # Add epsilon to prevent division by zero
-    return (g / (x + eps),)
+    """Backward pass for goom_log with gradient clipping for tiny |x|."""
+    eps = 1e-7
+    x_mag = jnp.abs(x)
+    # When |x| is tiny, gradient 1/x explodes. Clamp the denominator.
+    # For complex x, we need to be careful to maintain direction.
+    # Use max(|x|, eps) as the effective magnitude for gradient computation
+    safe_mag = jnp.maximum(x_mag, eps)
+    # Reconstruct safe_x with original phase but safe magnitude
+    # safe_x = x * (safe_mag / |x|) when |x| > 0, else eps
+    safe_x = jnp.where(x_mag < eps, eps + 0j, x * safe_mag / (x_mag + 1e-10))
+    return (g / safe_x,)
 
 
 goom_log.defvjp(goom_log_fwd, goom_log_bwd)
@@ -142,18 +149,33 @@ def to_goom(x: jax.Array) -> jax.Array:
     - Real part: log(|x|)
     - Imaginary part: 0 for positive, pi for negative (via log of negative)
 
+    Includes complex-safe epsilon handling for near-zero values to prevent
+    -inf in the log and gradient explosion in backward pass.
+
     Args:
         x: Input tensor (real or complex)
 
     Returns:
         Complex tensor in GOOM representation
     """
+    eps = 1e-7
+
     if config.cast_all_logs_to_complex:
         # Cast to complex to handle negative values properly
         x_complex = x.astype(jnp.complex64) if not jnp.iscomplexobj(x) else x
-        return goom_log(x_complex)
+
+        # Complex-safe epsilon: preserve phase for non-zero, use eps+0j for zero
+        x_mag = jnp.abs(x_complex)
+        x_safe = jnp.where(
+            x_mag < eps,
+            eps + 0j,  # Safe floor with zero phase
+            x_complex
+        )
+        return goom_log(x_safe)
     else:
-        return goom_log(x)
+        # For real inputs, just add eps to avoid log(0)
+        x_safe = jnp.where(jnp.abs(x) < eps, eps, x)
+        return goom_log(x_safe)
 
 
 def from_goom(log_x: jax.Array) -> jax.Array:

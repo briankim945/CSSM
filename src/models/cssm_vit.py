@@ -98,9 +98,12 @@ class CSSMBlock(nn.Module):
     """
     ViT-style block with CSSM instead of attention.
 
-    Structure (pre-norm):
-        x → LayerNorm → CSSM → + x
-          → LayerNorm → MLP  → + x
+    Structure (pre-norm with layer scale):
+        x → LayerNorm → CSSM → γ1 * → DropPath → + x
+          → LayerNorm → MLP  → γ2 * → DropPath → + x
+
+    Layer scale (γ initialized near 0) prevents early runaway activations
+    and improves training stability, especially for deep networks.
 
     Attributes:
         dim: Feature dimension
@@ -109,6 +112,8 @@ class CSSMBlock(nn.Module):
         drop_path: Drop path probability
         dense_mixing: CSSM dense mixing flag
         concat_xy: CSSM concat_xy flag
+        gate_activation: Gate activation type for GatedOpponentCSSM
+        layer_scale_init: Initial value for layer scale (near 0 for stability)
     """
     dim: int
     cssm_cls: Type[nn.Module]
@@ -116,6 +121,8 @@ class CSSMBlock(nn.Module):
     drop_path: float = 0.0
     dense_mixing: bool = False
     concat_xy: bool = True
+    gate_activation: str = 'sigmoid'
+    layer_scale_init: float = 1e-6
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
@@ -126,8 +133,18 @@ class CSSMBlock(nn.Module):
             channels=self.dim,
             dense_mixing=self.dense_mixing,
             concat_xy=self.concat_xy,
+            gate_activation=self.gate_activation,
             name='cssm'
         )(x)
+
+        # Layer scale for CSSM branch
+        gamma1 = self.param(
+            'gamma1',
+            nn.initializers.constant(self.layer_scale_init),
+            (self.dim,)
+        )
+        x = x * gamma1
+
         x = DropPath(self.drop_path)(x, deterministic=not training)
         x = residual + x
 
@@ -139,6 +156,15 @@ class CSSMBlock(nn.Module):
             out_dim=self.dim,
             name='mlp'
         )(x)
+
+        # Layer scale for MLP branch
+        gamma2 = self.param(
+            'gamma2',
+            nn.initializers.constant(self.layer_scale_init),
+            (self.dim,)
+        )
+        x = x * gamma2
+
         x = DropPath(self.drop_path)(x, deterministic=not training)
         x = residual + x
 
@@ -173,6 +199,7 @@ class CSSMViT(nn.Module):
     cssm_type: str = 'opponent'
     dense_mixing: bool = False
     concat_xy: bool = True
+    gate_activation: str = 'sigmoid'
     use_pos_embed: bool = True
 
     @nn.compact
@@ -224,14 +251,16 @@ class CSSMViT(nn.Module):
                 drop_path=float(dp_rates[i]),
                 dense_mixing=self.dense_mixing,
                 concat_xy=self.concat_xy,
+                gate_activation=self.gate_activation,
                 name=f'block{i}'
             )(x, training=training)
 
         # Final norm
         x = nn.LayerNorm(name='norm')(x)
 
-        # Global average pooling over T, H', W'
-        x = jnp.mean(x, axis=(1, 2, 3))  # (B, embed_dim)
+        # Use last timestep (after full recurrence), then spatial max pool
+        x = x[:, -1]  # (B, H', W', embed_dim) - final timestep
+        x = jnp.max(x, axis=(1, 2))  # (B, embed_dim) - spatial max
 
         # Classification head
         x = nn.Dense(self.num_classes, name='head')(x)

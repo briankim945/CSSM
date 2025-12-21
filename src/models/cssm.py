@@ -16,6 +16,26 @@ from .math import cssm_scalar_scan_op, cssm_matrix_scan_op
 from .goom import to_goom, from_goom
 
 
+def _stable_spectral_magnitude(K: jnp.ndarray, rho: float = 0.99) -> jnp.ndarray:
+    """
+    Squash complex spectral magnitude to guarantee |K| < 1 for dynamic stability.
+
+    Uses the formula K * rho / (1 + |K|) which:
+    - Preserves phase exactly
+    - Maps any magnitude to < rho (always < 1)
+    - Is smooth and differentiable everywhere
+
+    Args:
+        K: Complex spectral coefficients
+        rho: Maximum output magnitude (should be < 1 for stability)
+
+    Returns:
+        Squashed spectral coefficients with |output| < rho
+    """
+    K_mag = jnp.abs(K)
+    return K * rho / (1.0 + K_mag)
+
+
 class StandardCSSM(nn.Module):
     """
     Standard Log-Spectral State Space Model.
@@ -30,11 +50,13 @@ class StandardCSSM(nn.Module):
                      If False, use fully independent depthwise kernels.
         kernel_size: Spatial kernel size (square)
         concat_xy: Unused (for API compatibility with GatedOpponentCSSM)
+        gate_activation: Unused (for API compatibility with GatedOpponentCSSM)
     """
     channels: int
     dense_mixing: bool = False
     kernel_size: int = 15
     concat_xy: bool = True  # Unused, for API compatibility
+    gate_activation: str = 'sigmoid'  # Unused, for API compatibility
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -98,14 +120,12 @@ class StandardCSSM(nn.Module):
 
         # RFFT over spatial dims (axes 1, 2 of kernel -> H, W)
         K_hat_raw = jnp.fft.rfft2(k_padded, axes=(1, 2))  # (C, H, W_freq)
-        # Clip spectral coefficients to prevent log-space explosion
-        K_hat = jnp.clip(K_hat_raw.real, -10.0, 10.0) + 1j * jnp.clip(K_hat_raw.imag, -10.0, 10.0)
+        # Squash spectral magnitude to ensure stability (|K| < 1)
+        K_hat = _stable_spectral_magnitude(K_hat_raw, rho=0.99)
 
         # Reshape input for FFT: (B, T, H, W, C) -> (B, T, C, H, W)
         x_perm = x.transpose(0, 1, 4, 2, 3)
-        U_hat_raw = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
-        # Clip input spectral coefficients to prevent log-space explosion
-        U_hat = jnp.clip(U_hat_raw.real, -10.0, 10.0) + 1j * jnp.clip(U_hat_raw.imag, -10.0, 10.0)
+        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_freq)
 
         # --- 3. Cepstral Scan ---
         # Convert to GOOM representation (numerically stable log-space)
@@ -144,11 +164,24 @@ class GatedOpponentCSSM(nn.Module):
         dense_mixing: If True, use multi-head parameter sharing
         kernel_size: Spatial kernel size for excitation/inhibition kernels
         concat_xy: If True, concat [X,Y] and project to C channels
+        gate_activation: Activation for gates ('sigmoid', 'softplus_clamped', 'tanh_scaled')
     """
     channels: int
     dense_mixing: bool = False
     kernel_size: int = 11
     concat_xy: bool = True
+    gate_activation: str = 'sigmoid'
+
+    def _apply_gate_activation(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply configured activation to gate values."""
+        if self.gate_activation == 'sigmoid':
+            return nn.sigmoid(x)  # [0, 1] - safe default
+        elif self.gate_activation == 'softplus_clamped':
+            return jnp.minimum(nn.softplus(x), 2.0)  # [0, 2] with clamp
+        elif self.gate_activation == 'tanh_scaled':
+            return (jnp.tanh(x) + 1) * 0.5  # [0, 1] centered around 0.5
+        else:
+            return nn.sigmoid(x)  # fallback to safe default
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -168,12 +201,12 @@ class GatedOpponentCSSM(nn.Module):
         ctx = x.mean(axis=(2, 3))
 
         # Decay Gates (Diagonal elements of transition matrix)
-        alpha = nn.sigmoid(nn.Dense(C, name='alpha_gate')(ctx))  # X decay
-        delta = nn.sigmoid(nn.Dense(C, name='delta_gate')(ctx))  # Y decay
+        alpha = self._apply_gate_activation(nn.Dense(C, name='alpha_gate')(ctx))  # X decay
+        delta = self._apply_gate_activation(nn.Dense(C, name='delta_gate')(ctx))  # Y decay
 
-        # Coupling Gates (Off-diagonal elements) - sigmoid bounds to [0,1] for stability
-        mu = nn.sigmoid(nn.Dense(C, name='mu_gate')(ctx))      # Inhibition X->Y
-        gamma = nn.sigmoid(nn.Dense(C, name='gamma_gate')(ctx)) # Excitation Y->X
+        # Coupling Gates (Off-diagonal elements) - bounded by gate_activation for stability
+        mu = self._apply_gate_activation(nn.Dense(C, name='mu_gate')(ctx))      # Inhibition X->Y
+        gamma = self._apply_gate_activation(nn.Dense(C, name='gamma_gate')(ctx)) # Excitation Y->X
 
         # --- 2. Learnable Decay Parameter ---
         # Base decay is learnable per-channel (initialized near 0.9)
@@ -203,11 +236,13 @@ class GatedOpponentCSSM(nn.Module):
                 mode='constant'
             )
 
-        K_E_raw = jnp.fft.rfft2(pad_kernel(k_exc), axes=(1, 2))  # (C, H, W_f)
-        K_I_raw = jnp.fft.rfft2(pad_kernel(k_inh), axes=(1, 2))
-        # Clip spectral coefficients to prevent log-space explosion
-        K_E_spec = jnp.clip(K_E_raw.real, -10.0, 10.0) + 1j * jnp.clip(K_E_raw.imag, -10.0, 10.0)
-        K_I_spec = jnp.clip(K_I_raw.real, -10.0, 10.0) + 1j * jnp.clip(K_I_raw.imag, -10.0, 10.0)
+        # Batch kernel FFTs: stack and do single FFT call (2 -> 1 FFT)
+        k_stacked = jnp.stack([pad_kernel(k_exc), pad_kernel(k_inh)], axis=0)  # (2, C, H, W)
+        K_stacked_raw = jnp.fft.rfft2(k_stacked, axes=(2, 3))  # (2, C, H, W_f)
+        K_E_raw, K_I_raw = K_stacked_raw[0], K_stacked_raw[1]
+        # Squash coupling kernel magnitudes to ensure 2x2 matrix spectral radius < 1
+        K_E_spec = _stable_spectral_magnitude(K_E_raw, rho=0.99)
+        K_I_spec = _stable_spectral_magnitude(K_I_raw, rho=0.99)
 
         # --- 4. Build Transition Matrix ---
         # Target shape: (B, T, C, H, W_f, 2, 2)
@@ -248,9 +283,7 @@ class GatedOpponentCSSM(nn.Module):
         # --- 5. Input Vector ---
         # FFT the input
         x_perm = x.transpose(0, 1, 4, 2, 3)  # (B, T, C, H, W)
-        U_hat_raw = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_f)
-        # Clip input spectral coefficients to prevent log-space explosion
-        U_hat = jnp.clip(U_hat_raw.real, -10.0, 10.0) + 1j * jnp.clip(U_hat_raw.imag, -10.0, 10.0)
+        U_hat = jnp.fft.rfft2(x_perm, axes=(3, 4))  # (B, T, C, H, W_f)
 
         # Input drives X channel (index 0), Y channel gets zero input
         # log(0) = -inf is fine because exp(-inf) = 0 in the LSE
@@ -265,20 +298,21 @@ class GatedOpponentCSSM(nn.Module):
         )
 
         # --- 7. Output ---
-        # Extract Y channel (index 1) as output
-        Y_log = State_log[..., 1]
-        Y_hat = from_goom(Y_log)
-        y_out = jnp.fft.irfft2(Y_hat, s=(H, W), axes=(3, 4))
-        y_out = y_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
-
         if self.concat_xy:
-            # Also extract X channel, concat [X, Y], project to C
-            X_log = State_log[..., 0]
-            X_hat = from_goom(X_log)
-            x_out = jnp.fft.irfft2(X_hat, s=(H, W), axes=(3, 4))
-            x_out = x_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
-
-            xy_concat = jnp.concatenate([x_out, y_out], axis=-1)  # (B, T, H, W, 2C)
-            return nn.Dense(C, name='output_proj')(xy_concat)
+            # Batch IFFT for both X and Y channels (2 -> 1 IFFT)
+            # State_log has shape (..., 2) where last dim is [X, Y]
+            XY_hat = from_goom(State_log)  # (B, T, C, H, W_f, 2)
+            # Move channel dim for batched IFFT: (B, T, C, H, W_f, 2) -> (B, T, C, 2, H, W_f)
+            XY_hat = XY_hat.transpose(0, 1, 2, 5, 3, 4)
+            # Reshape to batch the 2 channels: (B, T, C*2, H, W_f)
+            XY_hat = XY_hat.reshape(B, T, C * 2, H, -1)
+            xy_out = jnp.fft.irfft2(XY_hat, s=(H, W), axes=(3, 4))  # (B, T, C*2, H, W)
+            xy_out = xy_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C*2)
+            return nn.Dense(C, name='output_proj')(xy_out)
         else:
+            # Only need Y channel (index 1)
+            Y_log = State_log[..., 1]
+            Y_hat = from_goom(Y_log)
+            y_out = jnp.fft.irfft2(Y_hat, s=(H, W), axes=(3, 4))
+            y_out = y_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, C)
             return y_out

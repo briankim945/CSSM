@@ -109,6 +109,7 @@ class CSSMNextBlock(nn.Module):
         cssm_cls: CSSM class to use (StandardCSSM or GatedOpponentCSSM)
         dense_mixing: Whether CSSM should use dense (multi-head) mixing
         concat_xy: Whether to concat [X,Y] and project (GatedOpponentCSSM only)
+        gate_activation: Gate activation type for GatedOpponentCSSM
         drop_path: Drop path probability
         layer_scale_init_value: Initial value for layer scale
     """
@@ -116,6 +117,7 @@ class CSSMNextBlock(nn.Module):
     cssm_cls: Type[nn.Module]
     dense_mixing: bool = False
     concat_xy: bool = True
+    gate_activation: str = 'sigmoid'
     drop_path: float = 0.0
     layer_scale_init_value: float = 1e-6
 
@@ -131,6 +133,7 @@ class CSSMNextBlock(nn.Module):
             channels=self.dim,
             dense_mixing=self.dense_mixing,
             concat_xy=self.concat_xy,
+            gate_activation=self.gate_activation,
             name='cssm'
         )(x)
 
@@ -168,12 +171,14 @@ class HybridBlock(nn.Module):
         cssm_cls: CSSM class to use
         dense_mixing: Whether CSSM should use dense mixing
         concat_xy: Whether to concat [X,Y] and project (GatedOpponentCSSM only)
+        gate_activation: Gate activation type for GatedOpponentCSSM
         drop_path: Drop path probability
     """
     dim: int
     cssm_cls: Type[nn.Module]
     dense_mixing: bool = False
     concat_xy: bool = True
+    gate_activation: str = 'sigmoid'
     drop_path: float = 0.0
 
     @nn.compact
@@ -194,6 +199,7 @@ class HybridBlock(nn.Module):
             channels=self.dim,
             dense_mixing=self.dense_mixing,
             concat_xy=self.concat_xy,
+            gate_activation=self.gate_activation,
             name='cssm'
         )(y)
         y = nn.LayerNorm(name='post_norm')(y)  # Post-Norm
@@ -226,6 +232,7 @@ class ModelFactory(nn.Module):
         depths: Number of blocks per stage (default: [1, 1, 1, 1])
         drop_path_rate: Maximum drop path rate (linearly increases)
         concat_xy: Whether to concat [X,Y] and project (GatedOpponentCSSM only)
+        gate_activation: Gate activation type for GatedOpponentCSSM
     """
     mode: str
     cssm_type: str
@@ -234,6 +241,7 @@ class ModelFactory(nn.Module):
     depths: tuple = (1, 1, 1, 1)
     drop_path_rate: float = 0.1
     concat_xy: bool = True
+    gate_activation: str = 'sigmoid'
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
@@ -299,6 +307,7 @@ class ModelFactory(nn.Module):
                         cssm_cls=CSSM,
                         dense_mixing=dense,
                         concat_xy=self.concat_xy,
+                        gate_activation=self.gate_activation,
                         drop_path=dp_rate,
                         name=f'stage{stage_idx}_block{block_idx_in_stage}'
                     )(x, training=training)
@@ -308,6 +317,7 @@ class ModelFactory(nn.Module):
                         cssm_cls=CSSM,
                         dense_mixing=dense,
                         concat_xy=self.concat_xy,
+                        gate_activation=self.gate_activation,
                         drop_path=dp_rate,
                         name=f'stage{stage_idx}_block{block_idx_in_stage}'
                     )(x, training=training)

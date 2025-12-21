@@ -15,6 +15,7 @@ Training features:
 
 import argparse
 import os
+import time
 from functools import partial
 from typing import Any, Dict, Tuple
 
@@ -29,7 +30,9 @@ import orbax.checkpoint as ocp
 
 from src.models.convnext import ModelFactory
 from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
+from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit_small
 from src.data import get_imagenette_video_loader, get_dataset_info
+from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info
 
 
 class TrainState(train_state.TrainState):
@@ -80,6 +83,10 @@ def create_train_state(
         optax.clip_by_global_norm(grad_clip),
         optax.adamw(learning_rate=schedule, weight_decay=weight_decay),
     )
+
+    # Wrap with apply_if_finite to skip updates on NaN/Inf gradients
+    # This prevents NaN propagation and helps debug where instability originates
+    tx = optax.apply_if_finite(tx, max_consecutive_errors=5)
 
     state = TrainState.create(
         apply_fn=model.apply,
@@ -216,8 +223,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train CSSM models')
 
     # Architecture selection
-    parser.add_argument('--arch', type=str, choices=['convnext', 'vit'], default='convnext',
-                        help='Architecture: convnext (ConvNeXt-style) or vit (ViT-style pre-norm)')
+    parser.add_argument('--arch', type=str, choices=['convnext', 'vit', 'baseline'], default='convnext',
+                        help='Architecture: convnext, vit (CSSM-ViT), or baseline (standard ViT)')
 
     # Model configuration (ConvNeXt-style)
     parser.add_argument('--mode', type=str, choices=['pure', 'hybrid'], default='pure',
@@ -228,16 +235,25 @@ def main():
                         help='Mixing type: dense (multi-head) or depthwise')
     parser.add_argument('--no_concat_xy', action='store_true',
                         help='Disable [X,Y] concat+project in GatedOpponentCSSM')
+    parser.add_argument('--gate_activation', type=str, default='sigmoid',
+                        choices=['sigmoid', 'softplus_clamped', 'tanh_scaled'],
+                        help='Gate activation for coupling (sigmoid=bounded [0,1], default)')
 
-    # Model configuration (ViT-style)
+    # Model configuration (ViT-style and baseline)
     parser.add_argument('--embed_dim', type=int, default=384,
-                        help='[vit] Embedding dimension (192=tiny, 384=small, 768=base)')
+                        help='[vit/baseline] Embedding dimension (192=tiny, 384=small, 768=base)')
     parser.add_argument('--depth', type=int, default=12,
-                        help='[vit] Number of transformer blocks')
+                        help='[vit/baseline] Number of transformer blocks')
     parser.add_argument('--patch_size', type=int, default=16,
-                        help='[vit] Patch size for stem')
+                        help='[vit/baseline] Patch size for stem')
     parser.add_argument('--no_pos_embed', action='store_true',
-                        help='[vit] Disable position embeddings')
+                        help='[vit/baseline] Disable position embeddings')
+    parser.add_argument('--num_heads', type=int, default=6,
+                        help='[baseline] Number of attention heads')
+    parser.add_argument('--no_temporal_attn', action='store_true',
+                        help='[baseline] Disable temporal attention blocks')
+    parser.add_argument('--temporal_attn_every', type=int, default=3,
+                        help='[baseline] Add temporal attention every N spatial blocks')
 
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=8,
@@ -266,9 +282,13 @@ def main():
                         help='Save checkpoint every N epochs')
 
     # Data
+    parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder'], default='imagenette',
+                        help='Dataset to use: imagenette (video) or pathfinder (static)')
     parser.add_argument('--data_dir', type=str,
                         default='/media/data_cifs/projects/prj_video_imagenet/fftconv/data/imagenette2-320',
-                        help='Path to imagenette2-320 dataset directory')
+                        help='Path to dataset directory')
+    parser.add_argument('--pathfinder_difficulty', type=str, choices=['9', '14', '20'], default='9',
+                        help='[pathfinder] Contour length difficulty (9=easy, 20=hard)')
 
     # Misc
     parser.add_argument('--seed', type=int, default=42,
@@ -281,8 +301,15 @@ def main():
     # Generate run name from config
     if args.arch == 'vit':
         run_name = f"vit_{args.cssm}_d{args.depth}_e{args.embed_dim}"
+    elif args.arch == 'baseline':
+        temporal_str = f"_temp{args.temporal_attn_every}" if not args.no_temporal_attn else "_notime"
+        run_name = f"baseline_d{args.depth}_e{args.embed_dim}_h{args.num_heads}{temporal_str}"
     else:
         run_name = f"{args.mode}_{args.cssm}_{args.mixing}"
+
+    # Add dataset to run name
+    if args.dataset == 'pathfinder':
+        run_name = f"pf{args.pathfinder_difficulty}_{run_name}"
     print(f"\n{'='*60}")
     print(f"Running Configuration: {run_name}")
     print(f"Architecture: {args.arch.upper()}")
@@ -301,13 +328,22 @@ def main():
     rng, init_rng = jax.random.split(rng)
 
     # Get dataset info
-    dataset_info = get_dataset_info()
+    if args.dataset == 'pathfinder':
+        # Set default data dir for pathfinder if not specified
+        if 'imagenette' in args.data_dir:
+            args.data_dir = '/media/data_cifs_lrs/projects/prj_LRA/PathFinder/pathfinder300_new_2025'
+        dataset_info = get_pathfinder_info(args.pathfinder_difficulty)
+        dataset_name = f"Pathfinder (difficulty={args.pathfinder_difficulty})"
+    else:
+        dataset_info = get_dataset_info()
+        dataset_name = "Imagenette"
+
     num_classes = dataset_info['num_classes']
     train_size = dataset_info['train_size']
     steps_per_epoch = train_size // args.batch_size
     total_steps = steps_per_epoch * args.epochs
 
-    print(f"Dataset: Imagenette")
+    print(f"Dataset: {dataset_name}")
     print(f"  Data dir: {args.data_dir}")
     print(f"  Train samples: {train_size}")
     print(f"  Num classes: {num_classes}")
@@ -324,6 +360,18 @@ def main():
             cssm_type=args.cssm,
             dense_mixing=(args.mixing == 'dense'),
             concat_xy=not args.no_concat_xy,
+            gate_activation=args.gate_activation,
+            use_pos_embed=not args.no_pos_embed,
+        )
+    elif args.arch == 'baseline':
+        model = BaselineViT(
+            num_classes=num_classes,
+            embed_dim=args.embed_dim,
+            depth=args.depth,
+            patch_size=args.patch_size,
+            num_heads=args.num_heads,
+            use_temporal_attn=not args.no_temporal_attn,
+            temporal_attn_every=args.temporal_attn_every,
             use_pos_embed=not args.no_pos_embed,
         )
     else:
@@ -333,6 +381,7 @@ def main():
             mixing=args.mixing,
             num_classes=num_classes,
             concat_xy=not args.no_concat_xy,
+            gate_activation=args.gate_activation,
         )
 
     # Initialize training state
@@ -367,32 +416,50 @@ def main():
         state = state.replace(epoch=epoch)
 
         # Create fresh data loaders each epoch
-        train_loader = get_imagenette_video_loader(
-            data_dir=args.data_dir,
-            batch_size=args.batch_size,
-            sequence_length=args.seq_len,
-            split='train',
-        )
+        if args.dataset == 'pathfinder':
+            train_loader = get_pathfinder_loader(
+                root=args.data_dir,
+                difficulty=args.pathfinder_difficulty,
+                batch_size=args.batch_size,
+                num_frames=args.seq_len,
+                split='train',
+            )
+        else:
+            train_loader = get_imagenette_video_loader(
+                data_dir=args.data_dir,
+                batch_size=args.batch_size,
+                sequence_length=args.seq_len,
+                split='train',
+            )
 
         # Training
         epoch_loss = 0.0
         epoch_acc = 0.0
         num_batches = 0
+        epoch_step_times = []
 
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}") as pbar:
             for batch in pbar:
                 rng, step_rng = jax.random.split(rng)
+
+                # Time the training step
+                step_start = time.perf_counter()
                 state, metrics = train_step(state, batch, step_rng, num_classes)
+                # Block until computation completes for accurate timing
+                jax.block_until_ready(metrics)
+                step_time = time.perf_counter() - step_start
+                epoch_step_times.append(step_time)
 
                 epoch_loss += float(metrics['train_loss'])
                 epoch_acc += float(metrics['train_acc'])
                 num_batches += 1
                 global_step += 1
 
-                # Update progress bar
+                # Update progress bar with timing
                 pbar.set_postfix({
                     'loss': f"{metrics['train_loss']:.4f}",
                     'acc': f"{metrics['train_acc']:.4f}",
+                    'ms/step': f"{step_time*1000:.1f}",
                 })
 
                 # Log to wandb
@@ -404,22 +471,41 @@ def main():
                         'train/acc': float(metrics['train_acc']),
                         'train/learning_rate': lr,
                         'train/step': global_step,
+                        'timing/step_ms': step_time * 1000,
+                        'timing/throughput_samples_per_sec': args.batch_size / step_time,
                     }, step=global_step)
 
         # Epoch summary
         avg_train_loss = epoch_loss / max(num_batches, 1)
         avg_train_acc = epoch_acc / max(num_batches, 1)
 
+        # Timing statistics
+        avg_step_time_ms = sum(epoch_step_times) / len(epoch_step_times) * 1000 if epoch_step_times else 0
+        min_step_time_ms = min(epoch_step_times) * 1000 if epoch_step_times else 0
+        max_step_time_ms = max(epoch_step_times) * 1000 if epoch_step_times else 0
+        throughput = args.batch_size / (sum(epoch_step_times) / len(epoch_step_times)) if epoch_step_times else 0
+
         print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc:.4f}")
+        print(f"  Timing: avg={avg_step_time_ms:.1f}ms/step, min={min_step_time_ms:.1f}ms, max={max_step_time_ms:.1f}ms, throughput={throughput:.1f} samples/sec")
 
         # Validation
         if (epoch + 1) % args.eval_every == 0:
-            val_loader = get_imagenette_video_loader(
-                data_dir=args.data_dir,
-                batch_size=args.batch_size,
-                sequence_length=args.seq_len,
-                split='val',
-            )
+            if args.dataset == 'pathfinder':
+                val_loader = get_pathfinder_loader(
+                    root=args.data_dir,
+                    difficulty=args.pathfinder_difficulty,
+                    batch_size=args.batch_size,
+                    num_frames=args.seq_len,
+                    split='val',
+                    shuffle=False,
+                )
+            else:
+                val_loader = get_imagenette_video_loader(
+                    data_dir=args.data_dir,
+                    batch_size=args.batch_size,
+                    sequence_length=args.seq_len,
+                    split='val',
+                )
             val_metrics = evaluate(state, val_loader, num_classes)
 
             print(f"Epoch {epoch+1} - Val Loss: {val_metrics['val_loss']:.4f}, "
@@ -430,6 +516,10 @@ def main():
                     'val/loss': val_metrics['val_loss'],
                     'val/acc': val_metrics['val_acc'],
                     'epoch': epoch + 1,
+                    'timing/epoch_avg_step_ms': avg_step_time_ms,
+                    'timing/epoch_min_step_ms': min_step_time_ms,
+                    'timing/epoch_max_step_ms': max_step_time_ms,
+                    'timing/epoch_throughput': throughput,
                 }, step=global_step)
 
             # Track best model
