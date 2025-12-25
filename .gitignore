@@ -76,6 +76,7 @@ venv.bak/
 *.sublime-workspace
 
 # Jupyter Notebook
+.ipynb_checkpoints
 .ipynb_checkpoints/
 *.ipynb
 

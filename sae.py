@@ -16,15 +16,16 @@ Training features:
 import argparse
 import os
 import time
+import sys
 from functools import partial
 from typing import Any, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
 import optax
-import wandb
 from flax import linen as nn
 from flax.training import train_state
+from flax.core.frozen_dict import freeze
 from tqdm import tqdm
 import orbax.checkpoint as ocp
 
@@ -33,6 +34,7 @@ from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
 from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit_small
 from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenette_video_loader_train_val_split
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info
+from xai.sae_utils import train_sae_on_activations
 
 
 class TrainState(train_state.TrainState):
@@ -95,7 +97,7 @@ def create_train_state(
         epoch=0,
     )
 
-    return state, tx
+    return state, tx, variables
 
 
 @partial(jax.jit, static_argnums=(3,))
@@ -219,6 +221,19 @@ def evaluate(
     }
 
 
+def sae_analyze(state, inputs):
+    _, new_state = state.apply_fn(
+        {'params': state.params},
+        videos,
+        training=False,
+        mutable=["intermediates"]
+    )
+    intermediates = new_state['intermediates']
+    print('intermediates', intermediates.shape)
+
+    sae_state, sae_model = train_sae_on_activations(intermediates)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train CSSM models')
 
@@ -321,14 +336,6 @@ def main():
     print(f"Architecture: {args.arch.upper()}")
     print(f"{'='*60}\n")
 
-    # Initialize wandb
-    if not args.no_wandb:
-        wandb.init(
-            project=args.project,
-            name=run_name,
-            config=vars(args),
-        )
-
     # Set random seed
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
@@ -391,7 +398,7 @@ def main():
         )
 
     # Initialize training state
-    state, _ = create_train_state(
+    state, _, variables = create_train_state(
         rng=init_rng,
         model=model,
         learning_rate=args.lr,
@@ -404,159 +411,54 @@ def main():
     num_params = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
     print(f"Model parameters: {num_params:,}\n")
 
-    if not args.no_wandb:
-        wandb.config.update({'num_params': num_params})
-
     # Setup checkpointing (must be absolute path for orbax)
     checkpoint_dir = os.path.abspath(os.path.join(args.checkpoint_dir, run_name))
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    # os.makedirs(checkpoint_dir, exist_ok=True)
 
     checkpointer = ocp.StandardCheckpointer()
-    checkpoint_path = ocp.test_utils.erase_and_create_empty(checkpoint_dir)
+    # checkpoint_path = ocp.test_utils.erase_and_create_empty(checkpoint_dir)
 
     # Training loop
     global_step = 0
     best_val_acc = 0.0
 
     ### TABULATION
-    train_loader, _ = get_imagenette_video_loader_train_val_split(
+    train_loader, val_loader = get_imagenette_video_loader_train_val_split(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         sequence_length=args.seq_len,
     )
-    train_features, _ = next(iter(train_loader))
+    train_features, train_labels = next(iter(train_loader))
     print(model.tabulate(jax.random.PRNGKey(64), train_features))
     print()
 
-    for epoch in range(args.epochs):
-        state = state.replace(epoch=epoch)
+    #### RESTORE
 
-        # Create fresh data loaders each epoch
-        if args.dataset == 'pathfinder':
-            train_loader = get_pathfinder_loader(
-                root=args.data_dir,
-                difficulty=args.pathfinder_difficulty,
-                batch_size=args.batch_size,
-                num_frames=args.seq_len,
-                split='train',
-            )
-        else:
-            train_loader, val_loader = get_imagenette_video_loader_train_val_split(
-                data_dir=args.data_dir,
-                batch_size=args.batch_size,
-                sequence_length=args.seq_len,
-            )
+    restored_state = checkpointer.restore(
+        # '/users/bkim53/code_directories/CSSM/checkpoints/vit_standard_d12_e384_v1/epoch_45',
+        '/users/bkim53/code_directories/CSSM/checkpoints/vit_standard_d12_e384/epoch_100',
+        target=state
+        # abstract_my_tree
+    )
+    # print(raw_restore)
 
-        # Training
-        epoch_loss = 0.0
-        epoch_acc = 0.0
-        num_batches = 0
-        epoch_step_times = []
+    # assert jax.tree_util.tree_all(jax.tree.map(lambda x, y: (x == y).all(), state.params, restored_state.params))
+    print(restored_state.params.keys())
+    print(restored_state.params['block11'].keys())
+    print(restored_state.params['block11']['cssm'].keys())
+    print(restored_state.params['block11']['cssm']['kernel'].shape)
+    print(variables['params'].keys())
+    print('perturbations' in variables)
+    # assert jax.tree_util.tree_all(jax.tree.map(lambda x, y: (x == y).all(), state.params, variables['params']))
+    # print(variables['perturbations'].keys())
 
-        with tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}") as pbar:
-            for batch in pbar:
-                rng, step_rng = jax.random.split(rng)
+    val_metrics = evaluate(restored_state, val_loader, num_classes)
+    print(val_metrics)
 
-                # Time the training step
-                step_start = time.perf_counter()
-                state, metrics = train_step(state, batch, step_rng, num_classes)
-                # Block until computation completes for accurate timing
-                jax.block_until_ready(metrics)
-                step_time = time.perf_counter() - step_start
-                epoch_step_times.append(step_time)
-
-                epoch_loss += float(metrics['train_loss'])
-                epoch_acc += float(metrics['train_acc'])
-                num_batches += 1
-                global_step += 1
-
-                # Update progress bar with timing
-                pbar.set_postfix({
-                    'loss': f"{metrics['train_loss']:.4f}",
-                    'acc': f"{metrics['train_acc']:.4f}",
-                    'ms/step': f"{step_time*1000:.1f}",
-                })
-
-                # Log to wandb
-                if not args.no_wandb and global_step % args.log_every == 0:
-                    # Get current learning rate from optimizer state
-                    lr = args.lr  # Simplified - actual LR from schedule
-                    wandb.log({
-                        'train/loss': float(metrics['train_loss']),
-                        'train/acc': float(metrics['train_acc']),
-                        'train/learning_rate': lr,
-                        'train/step': global_step,
-                        'timing/step_ms': step_time * 1000,
-                        'timing/throughput_samples_per_sec': args.batch_size / step_time,
-                    }, step=global_step)
-
-        # Epoch summary
-        avg_train_loss = epoch_loss / max(num_batches, 1)
-        avg_train_acc = epoch_acc / max(num_batches, 1)
-
-        # Timing statistics
-        avg_step_time_ms = sum(epoch_step_times) / len(epoch_step_times) * 1000 if epoch_step_times else 0
-        min_step_time_ms = min(epoch_step_times) * 1000 if epoch_step_times else 0
-        max_step_time_ms = max(epoch_step_times) * 1000 if epoch_step_times else 0
-        throughput = args.batch_size / (sum(epoch_step_times) / len(epoch_step_times)) if epoch_step_times else 0
-
-        print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc:.4f}")
-        print(f"  Timing: avg={avg_step_time_ms:.1f}ms/step, min={min_step_time_ms:.1f}ms, max={max_step_time_ms:.1f}ms, throughput={throughput:.1f} samples/sec")
-
-        # Validation
-        if (epoch + 1) % args.eval_every == 0:
-            if args.dataset == 'pathfinder':
-                val_loader = get_pathfinder_loader(
-                    root=args.data_dir,
-                    difficulty=args.pathfinder_difficulty,
-                    batch_size=args.batch_size,
-                    num_frames=args.seq_len,
-                    split='val',
-                    shuffle=False,
-                )
-            # else:
-            #     val_loader = get_imagenette_video_loader(
-            #         data_dir=args.data_dir,
-            #         batch_size=args.batch_size,
-            #         sequence_length=args.seq_len,
-            #         split='val',
-            #     )
-            val_metrics = evaluate(state, val_loader, num_classes)
-
-            print(f"Epoch {epoch+1} - Val Loss: {val_metrics['val_loss']:.4f}, "
-                  f"Val Acc: {val_metrics['val_acc']:.4f}")
-
-            if not args.no_wandb:
-                wandb.log({
-                    'val/loss': val_metrics['val_loss'],
-                    'val/acc': val_metrics['val_acc'],
-                    'epoch': epoch + 1,
-                    'timing/epoch_avg_step_ms': avg_step_time_ms,
-                    'timing/epoch_min_step_ms': min_step_time_ms,
-                    'timing/epoch_max_step_ms': max_step_time_ms,
-                    'timing/epoch_throughput': throughput,
-                }, step=global_step)
-
-            # Track best model
-            if val_metrics['val_acc'] > best_val_acc:
-                best_val_acc = val_metrics['val_acc']
-                print(f"  New best validation accuracy: {best_val_acc:.4f}")
-
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
-            ckpt_path = os.path.join(checkpoint_dir, f'epoch_{epoch+1}')
-            checkpointer.save(ckpt_path, state)
-            print(f"  Saved checkpoint to {ckpt_path}")
-
-    # Final summary
-    print(f"\n{'='*60}")
-    print(f"Training Complete!")
-    print(f"  Best Validation Accuracy: {best_val_acc:.4f}")
-    print(f"{'='*60}\n")
-
-    if not args.no_wandb:
-        wandb.log({'best_val_acc': best_val_acc})
-        wandb.finish()
+    # curr_image = train_features[None,0]
+    # curr_label = train_labels[None,0]
+    # display_prediction(restored_state, curr_image, curr_label)
+    sae_analyze(restored_state, train_features)
 
 
 if __name__ == '__main__':

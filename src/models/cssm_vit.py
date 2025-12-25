@@ -255,6 +255,9 @@ class CSSMViT(nn.Module):
                 name=f'block{i}'
             )(x, training=training)
 
+            if i == self.depth - 1:
+                self.sow('intermediates', 'features', x)
+
         # Final norm
         x = nn.LayerNorm(name='norm')(x)
 

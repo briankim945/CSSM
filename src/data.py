@@ -233,6 +233,62 @@ def get_imagenette_video_loader(
     )
 
 
+def get_imagenette_video_loader_train_val_split(
+    data_dir: str,
+    batch_size: int,
+    sequence_length: int = 8,
+    image_size: int = 224,
+):
+    """
+    Load Imagenette dataset and return a video data loader.
+
+    Creates "video" samples by repeating each static image T times.
+    This simulates video input for models designed for temporal data.
+
+    Args:
+        data_dir: Path to imagenette2-320 directory
+        batch_size: Number of samples per batch
+        sequence_length: Number of frames (T) to repeat each image
+        split: Dataset split ('train' or 'val')
+        image_size: Target image size (square)
+
+    Returns:
+        VideoDataLoader yielding (video, label) tuples where:
+            video: np.ndarray of shape (B, T, H, W, 3)
+            label: np.ndarray of shape (B,) with class indices
+    """
+    split='train'
+    print(f"Loading {split} split from {data_dir}...")
+    images, labels = load_dataset(data_dir, split, image_size)
+    indices = np.arange(images.shape[0])
+    np.random.shuffle(indices)
+    images = images[indices]
+    labels = labels[indices]
+    cutoff = int(len(images) * 0.8)
+    train_images = images[:cutoff]
+    train_labels = labels[:cutoff]
+    test_images = images[cutoff:]
+    test_labels = labels[cutoff:]
+    print(f"  Loaded {len(train_images)} train images")
+    print(f"  Loaded {len(test_images)} test images")
+    
+    return VideoDataLoader(
+        images=train_images,
+        labels=train_labels,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        shuffle=(split == 'train'),
+        drop_last=True,
+    ), VideoDataLoader(
+        images=test_images,
+        labels=test_labels,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        shuffle=(split == 'test'),
+        drop_last=True,
+    )
+
+
 def get_dataset_info() -> dict:
     """
     Get information about the Imagenette dataset.

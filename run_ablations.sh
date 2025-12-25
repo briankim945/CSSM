@@ -60,7 +60,8 @@ for CSSM_TYPE in "${CSSM_TYPES[@]}"; do
                 --epochs $EPOCHS \
                 --batch_size $BATCH_SIZE \
                 --project cssm_ablation \
-                --run_name $RUN_NAME"
+                --run_label "ablation"
+                # --run_name $RUN_NAME"
 
             # Add pathfinder difficulty if applicable
             if [ "$DATASET" == "pathfinder" ]; then
