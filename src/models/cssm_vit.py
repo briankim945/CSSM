@@ -203,7 +203,7 @@ class CSSMViT(nn.Module):
     use_pos_embed: bool = True
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, training: bool = True, return_activations: bool = False) -> jnp.ndarray:
         """
         Forward pass.
 
@@ -214,6 +214,8 @@ class CSSMViT(nn.Module):
         Returns:
             Logits tensor (B, num_classes)
         """
+        activations = {}
+
         B, T, H, W, C = x.shape
 
         # Select CSSM class
@@ -255,8 +257,12 @@ class CSSMViT(nn.Module):
                 name=f'block{i}'
             )(x, training=training)
 
-            if i == self.depth - 1:
-                self.sow('intermediates', 'features', x)
+            # if i == self.depth - 1:
+            #     self.sow('intermediates', 'features', x)
+
+            x = self.perturb(f'cssmblock_{i}_out', x)
+            if return_activations:
+                activations[f'cssmblock_{i}_out'] = x
 
         # Final norm
         x = nn.LayerNorm(name='norm')(x)
@@ -268,6 +274,8 @@ class CSSMViT(nn.Module):
         # Classification head
         x = nn.Dense(self.num_classes, name='head')(x)
 
+        if return_activations:
+            return x, activations
         return x
 
 

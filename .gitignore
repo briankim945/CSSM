@@ -131,3 +131,8 @@ temp/
 *.pem
 *.key
 credentials.json
+
+# outputs
+images
+activations
+feature_reports

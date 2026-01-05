@@ -7,8 +7,10 @@ static images across the temporal dimension.
 
 from pathlib import Path
 from typing import Iterator, Tuple
+from operator import itemgetter
 import numpy as np
 from PIL import Image
+from random import shuffle
 
 
 # Imagenette class folder names (10 classes)
@@ -90,10 +92,18 @@ def load_image_train(path: str, size: int = 224) -> np.ndarray:
     return arr
 
 
+def restore_image(im):
+    im = (im * IMAGENET_STD) + IMAGENET_MEAN
+    im = (im * 255.0).astype(np.uint8)
+    return im
+
+
 def load_dataset(
     data_dir: str,
     split: str = 'train',
     image_size: int = 224,
+    return_names: bool = False,
+    class_sample_size: int = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Load entire dataset into memory (Imagenette is small enough).
@@ -102,6 +112,8 @@ def load_dataset(
         data_dir: Path to imagenette2-320 directory
         split: 'train' or 'val'
         image_size: Target image size
+        return_names: Bool to determine whether to return file names
+        class_sample_size: Optional sample size of class
 
     Returns:
         images: (N, H, W, 3)
@@ -111,6 +123,7 @@ def load_dataset(
 
     images = []
     labels = []
+    filenames = []
 
     class_to_idx = {c: i for i, c in enumerate(IMAGENETTE_CLASSES)}
     load_fn = load_image_train if split == 'train' else load_image_val
@@ -119,16 +132,25 @@ def load_dataset(
         class_dir = split_dir / class_name
         if not class_dir.exists():
             continue
+            
+        img_paths = class_dir.glob('*.JPEG')
+        if class_sample_size is not None:
+            img_paths = [ip for ip in img_paths]
+            shuffle(img_paths)
+            img_paths = img_paths[:class_sample_size]
 
-        for img_path in class_dir.glob('*.JPEG'):
+        for img_path in img_paths:
             try:
                 img = load_fn(str(img_path), image_size)
                 images.append(img)
                 labels.append(class_to_idx[class_name])
+                filenames.append(img_path)
             except Exception as e:
                 print(f"Error loading {img_path}: {e}")
                 continue
 
+    if return_names:
+        return np.stack(images), np.array(labels), filenames
     return np.stack(images), np.array(labels)
 
 
@@ -148,6 +170,8 @@ class VideoDataLoader:
         sequence_length: int = 8,
         shuffle: bool = True,
         drop_last: bool = True,
+        file_names: list[str] = None,
+        return_names: bool = False,
     ):
         """
         Args:
@@ -165,6 +189,8 @@ class VideoDataLoader:
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.n_samples = len(images)
+        self.file_names = file_names
+        self.return_names = return_names
 
     def __len__(self):
         if self.drop_last:
@@ -183,6 +209,8 @@ class VideoDataLoader:
 
             batch_images = self.images[batch_indices]  # (B, H, W, 3)
             batch_labels = self.labels[batch_indices]  # (B,)
+            if self.return_names:
+                batch_names = [self.file_names[j] for j in batch_indices]
 
             # Repeat to create video: (B, H, W, 3) -> (B, T, H, W, 3)
             batch_videos = np.repeat(
@@ -191,7 +219,10 @@ class VideoDataLoader:
                 axis=1
             )
 
-            yield batch_videos, batch_labels
+            if self.return_names:
+                yield batch_videos, batch_labels, batch_names
+            else:
+                yield batch_videos, batch_labels
 
 
 def get_imagenette_video_loader(
@@ -233,11 +264,52 @@ def get_imagenette_video_loader(
     )
 
 
+def get_dataset_train_val_split(
+    data_dir: str,
+    image_size: int = 224,
+    split: str = 'train',
+    return_names: bool = False,
+    class_sample_size: int = None
+):
+    print(f"Loading {split} split from {data_dir}...")
+    if return_names:
+        images, labels, filenames_orig = load_dataset(data_dir, split, image_size, return_names=return_names, class_sample_size=class_sample_size)
+    else:
+        images, labels = load_dataset(data_dir, split, image_size, class_sample_size=class_sample_size)
+
+    indices = np.arange(images.shape[0])
+    np.random.shuffle(indices)
+
+    images = images[indices]
+    labels = labels[indices]
+    if return_names:
+        filenames = [filenames_orig[i] for i in indices]
+        
+    cutoff = int(len(images) * 0.8)
+    train_images = images[:cutoff]
+    train_labels = labels[:cutoff]
+    train_names = filenames[:cutoff]
+    test_images = images[cutoff:]
+    test_labels = labels[cutoff:]
+    test_names = filenames[cutoff:]
+
+    print(f"  Loaded {len(train_images)} train images")
+    print(f"  Loaded {len(test_images)} test images")
+
+    if return_names:
+        return train_images, train_labels, train_names, test_images, test_labels, test_names
+    else:
+        return train_images, train_labels, test_images, test_labels
+
+
 def get_imagenette_video_loader_train_val_split(
     data_dir: str,
     batch_size: int,
     sequence_length: int = 8,
     image_size: int = 224,
+    split: str = 'train',
+    return_names: bool = False,
+    class_sample_size: int = None,
 ):
     """
     Load Imagenette dataset and return a video data loader.
@@ -257,36 +329,50 @@ def get_imagenette_video_loader_train_val_split(
             video: np.ndarray of shape (B, T, H, W, 3)
             label: np.ndarray of shape (B,) with class indices
     """
-    split='train'
-    print(f"Loading {split} split from {data_dir}...")
-    images, labels = load_dataset(data_dir, split, image_size)
-    indices = np.arange(images.shape[0])
-    np.random.shuffle(indices)
-    images = images[indices]
-    labels = labels[indices]
-    cutoff = int(len(images) * 0.8)
-    train_images = images[:cutoff]
-    train_labels = labels[:cutoff]
-    test_images = images[cutoff:]
-    test_labels = labels[cutoff:]
-    print(f"  Loaded {len(train_images)} train images")
-    print(f"  Loaded {len(test_images)} test images")
-    
-    return VideoDataLoader(
-        images=train_images,
-        labels=train_labels,
-        batch_size=batch_size,
-        sequence_length=sequence_length,
-        shuffle=(split == 'train'),
-        drop_last=True,
-    ), VideoDataLoader(
-        images=test_images,
-        labels=test_labels,
-        batch_size=batch_size,
-        sequence_length=sequence_length,
-        shuffle=(split == 'test'),
-        drop_last=True,
-    )
+    if return_names:
+        train_images, train_labels, train_names, test_images, test_labels, test_names = get_dataset_train_val_split(
+            data_dir, image_size, split=split, return_names=return_names, class_sample_size=class_sample_size
+        )
+        
+        return VideoDataLoader(
+            images=train_images,
+            labels=train_labels,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            shuffle=(split == 'train'),
+            drop_last=True,
+            file_names=train_names,
+            return_names=return_names
+        ), VideoDataLoader(
+            images=test_images,
+            labels=test_labels,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            shuffle=(split == 'test'),
+            drop_last=True,
+            file_names=test_names,
+            return_names=return_names
+        )
+    else:
+        train_images, train_labels, test_images, test_labels = get_dataset_train_val_split(
+            data_dir, image_size, split=split, class_sample_size=class_sample_size
+        )
+        
+        return VideoDataLoader(
+            images=train_images,
+            labels=train_labels,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            shuffle=(split == 'train'),
+            drop_last=True,
+        ), VideoDataLoader(
+            images=test_images,
+            labels=test_labels,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            shuffle=(split == 'test'),
+            drop_last=True,
+        )
 
 
 def get_dataset_info() -> dict:

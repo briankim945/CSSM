@@ -17,6 +17,7 @@ import argparse
 import os
 import time
 import sys
+import random
 from functools import partial
 from typing import Any, Dict, Tuple
 
@@ -28,13 +29,18 @@ from flax.training import train_state
 from flax.core.frozen_dict import freeze
 from tqdm import tqdm
 import orbax.checkpoint as ocp
+import numpy as np
+from PIL import Image
 
 from src.models.convnext import ModelFactory
 from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
 from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit_small
-from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenette_video_loader_train_val_split
+from src.data import IMAGENETTE_CLASSES, load_image_val, get_dataset_info, get_imagenette_video_loader_train_val_split
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info
-from xai.sae_utils import train_sae_on_activations
+from xai.sae_utils import extract_activations_with_capture, save_activations, train_sae_on_activations, \
+        load_activations, find_top_k_activating_images, SAE, \
+        find_alive_features, find_class_specific_features, random_feature_sample, \
+        features_by_max_activation, analyze_and_document
 
 
 class TrainState(train_state.TrainState):
@@ -42,12 +48,12 @@ class TrainState(train_state.TrainState):
     epoch: int = 0
 
 
-def create_train_state(
+def get_init_state(
     rng: jax.Array,
     model: nn.Module,
-    learning_rate: float,
-    weight_decay: float,
-    total_steps: int,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-4,
+    total_steps: int = 10000,
     warmup_steps: int = 500,
     grad_clip: float = 1.0,
 ) -> Tuple[TrainState, optax.GradientTransformation]:
@@ -100,138 +106,17 @@ def create_train_state(
     return state, tx, variables
 
 
-@partial(jax.jit, static_argnums=(3,))
-def train_step(
-    state: TrainState,
-    batch: Tuple[jnp.ndarray, jnp.ndarray],
-    rng: jax.Array,
-    num_classes: int,
-) -> Tuple[TrainState, Dict[str, float]]:
-    """
-    Single training step.
-
-    Args:
-        state: Current training state
-        batch: Tuple of (videos, labels)
-        rng: Random key for dropout
-        num_classes: Number of output classes
-
-    Returns:
-        Tuple of (updated_state, metrics_dict)
-    """
-    videos, labels = batch
-
-    def loss_fn(params):
-        logits = state.apply_fn(
-            {'params': params},
-            videos,
-            training=True,
-            rngs={'dropout': rng},
-        )
-        one_hot = jax.nn.one_hot(labels, num_classes)
-        loss = optax.softmax_cross_entropy(logits, one_hot).mean()
-        return loss, logits
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
-
-    # Update state
-    state = state.apply_gradients(grads=grads)
-
-    # Compute metrics
-    acc = jnp.mean(jnp.argmax(logits, -1) == labels)
-
-    metrics = {
-        'train_loss': loss,
-        'train_acc': acc,
-    }
-
-    return state, metrics
-
-
-@partial(jax.jit, static_argnums=(2,))
-def eval_step(
-    state: TrainState,
-    batch: Tuple[jnp.ndarray, jnp.ndarray],
-    num_classes: int,
-) -> Dict[str, float]:
-    """
-    Single evaluation step.
-
-    Args:
-        state: Current training state
-        batch: Tuple of (videos, labels)
-        num_classes: Number of output classes
-
-    Returns:
-        Dictionary of metrics
-    """
-    videos, labels = batch
-
-    logits = state.apply_fn(
+def display_prediction(state, current_image, current_label):
+    logits, intermediates = state.apply_fn(
         {'params': state.params},
-        videos,
+        current_image,
         training=False,
+        mutable='intermediates',
     )
+    prediction = jnp.argmax(logits, -1)
 
-    one_hot = jax.nn.one_hot(labels, num_classes)
-    loss = optax.softmax_cross_entropy(logits, one_hot).mean()
-    acc = jnp.mean(jnp.argmax(logits, -1) == labels)
-
-    return {
-        'val_loss': loss,
-        'val_acc': acc,
-    }
-
-
-def evaluate(
-    state: TrainState,
-    val_loader,
-    num_classes: int,
-    num_batches: int = None,
-) -> Dict[str, float]:
-    """
-    Run full validation evaluation.
-
-    Args:
-        state: Current training state
-        val_loader: Validation data iterator
-        num_classes: Number of output classes
-        num_batches: Max batches to evaluate (None = all)
-
-    Returns:
-        Dictionary of averaged metrics
-    """
-    total_loss = 0.0
-    total_acc = 0.0
-    count = 0
-
-    for i, batch in enumerate(val_loader):
-        if num_batches is not None and i >= num_batches:
-            break
-
-        metrics = eval_step(state, batch, num_classes)
-        total_loss += float(metrics['val_loss'])
-        total_acc += float(metrics['val_acc'])
-        count += 1
-
-    return {
-        'val_loss': total_loss / max(count, 1),
-        'val_acc': total_acc / max(count, 1),
-    }
-
-
-def sae_analyze(state, inputs):
-    _, new_state = state.apply_fn(
-        {'params': state.params},
-        videos,
-        training=False,
-        mutable=["intermediates"]
-    )
-    intermediates = new_state['intermediates']
-    print('intermediates', intermediates.shape)
-
-    sae_state, sae_model = train_sae_on_activations(intermediates)
+    print("Prediction: ", prediction)
+    print("Label: ", current_label)
 
 
 def main():
@@ -269,99 +154,44 @@ def main():
                         help='[baseline] Disable temporal attention blocks')
     parser.add_argument('--temporal_attn_every', type=int, default=3,
                         help='[baseline] Add temporal attention every N spatial blocks')
-
-    # Training configuration
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size per device')
+    
+    # Data configuration
     parser.add_argument('--seq_len', type=int, default=8,
                         help='Sequence length (number of frames)')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Peak learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-4,
-                        help='Weight decay coefficient')
-    parser.add_argument('--grad_clip', type=float, default=1.0,
-                        help='Gradient clipping norm')
-
-    # Logging and checkpointing
-    parser.add_argument('--project', type=str, default='cssm-convnext',
-                        help='Wandb project name')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--log_every', type=int, default=10,
-                        help='Log metrics every N steps')
-    parser.add_argument('--eval_every', type=int, default=1,
-                        help='Evaluate every N epochs')
-    parser.add_argument('--save_every', type=int, default=5,
-                        help='Save checkpoint every N epochs')
-    parser.add_argument('--run_label', type=str, default=None,
-                        help='Any labels to add to the run name')                   
-
-    # Data
-    parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder'], default='imagenette',
-                        help='Dataset to use: imagenette (video) or pathfinder (static)')
-    parser.add_argument('--data_dir', type=str,
-                        default='/media/data_cifs/projects/prj_video_imagenet/fftconv/data/imagenette2-320',
-                        help='Path to dataset directory')
-    parser.add_argument('--pathfinder_difficulty', type=str, choices=['9', '14', '20'], default='9',
-                        help='[pathfinder] Contour length difficulty (9=easy, 20=hard)')
-
+    parser.add_argument('--target_class', type=str, default='n03417042',
+                        help='Imagenette class being targetted')
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size per device')
+    parser.add_argument('--create_act', action='store_true',
+                        help='Create activations from data folder')
+    parser.add_argument('--data_dir', type=str, default='data',
+                        help='Data folder to create activations from')
+    
+    # SAE configuration
+    parser.add_argument('--act_train', action='store_true',
+                        help='Flag to train a new SAE model')
+    parser.add_argument('--act_source', type=str, default='activation.npz',
+                        help='NPZ file to pull activations from')
+    parser.add_argument('--act_save', type=str, default='checkpoints/sae_trained',
+                        help='Location to checkpoint a saved SAE model')
+    parser.add_argument('--act_val_source', type=str, default='activations/val_cssmblocks_8_9_10_11.npz',
+                        help='Location to val data activations')
+    parser.add_argument('--act_val_labels', type=str, default='activations/val_labels.npz',
+                        help='Location to val labels')
+    parser.add_argument('--act_val_names', type=str, default='activations/val_names.npz',
+                        help='Location to val names')
+    
     # Misc
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
-    parser.add_argument('--no_wandb', action='store_true',
-                        help='Disable wandb logging')
 
     args = parser.parse_args()
-
-    # Generate run name from config
-    if args.arch == 'vit':
-        run_name = f"vit_{args.cssm}_d{args.depth}_e{args.embed_dim}"
-    elif args.arch == 'baseline':
-        temporal_str = f"_temp{args.temporal_attn_every}" if not args.no_temporal_attn else "_notime"
-        run_name = f"baseline_d{args.depth}_e{args.embed_dim}_h{args.num_heads}{temporal_str}"
-    else:
-        run_name = f"{args.mode}_{args.cssm}_{args.mixing}"
-
-    # Add dataset to run name
-    if args.dataset == 'pathfinder':
-        run_name = f"pf{args.pathfinder_difficulty}_{run_name}"
-
-    # Add run label, if any
-    if args.run_label is not None:
-        run_name = f"{run_name}_{args.run_label}"
-    print(f"\n{'='*60}")
-    print(f"Running Configuration: {run_name}")
-    print(f"Architecture: {args.arch.upper()}")
-    print(f"{'='*60}\n")
 
     # Set random seed
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    # Get dataset info
-    if args.dataset == 'pathfinder':
-        # Set default data dir for pathfinder if not specified
-        if 'imagenette' in args.data_dir:
-            args.data_dir = '/media/data_cifs_lrs/projects/prj_LRA/PathFinder/pathfinder300_new_2025'
-        dataset_info = get_pathfinder_info(args.pathfinder_difficulty)
-        dataset_name = f"Pathfinder (difficulty={args.pathfinder_difficulty})"
-    else:
-        dataset_info = get_dataset_info()
-        dataset_name = "Imagenette"
-
-    num_classes = dataset_info['num_classes']
-    train_size = dataset_info['train_size']
-    steps_per_epoch = train_size // args.batch_size
-    total_steps = steps_per_epoch * args.epochs
-
-    print(f"Dataset: {dataset_name}")
-    print(f"  Data dir: {args.data_dir}")
-    print(f"  Train samples: {train_size}")
-    print(f"  Num classes: {num_classes}")
-    print(f"  Steps per epoch: {steps_per_epoch}")
-    print(f"  Total steps: {total_steps}\n")
+    num_classes = len(IMAGENETTE_CLASSES)
 
     # Create model based on architecture
     if args.arch == 'vit':
@@ -398,13 +228,9 @@ def main():
         )
 
     # Initialize training state
-    state, _, variables = create_train_state(
+    state, _, variables = get_init_state(
         rng=init_rng,
         model=model,
-        learning_rate=args.lr,
-        weight_decay=args.weight_decay,
-        total_steps=total_steps,
-        grad_clip=args.grad_clip,
     )
 
     # Count parameters
@@ -412,53 +238,131 @@ def main():
     print(f"Model parameters: {num_params:,}\n")
 
     # Setup checkpointing (must be absolute path for orbax)
-    checkpoint_dir = os.path.abspath(os.path.join(args.checkpoint_dir, run_name))
-    # os.makedirs(checkpoint_dir, exist_ok=True)
-
     checkpointer = ocp.StandardCheckpointer()
-    # checkpoint_path = ocp.test_utils.erase_and_create_empty(checkpoint_dir)
-
-    # Training loop
-    global_step = 0
-    best_val_acc = 0.0
-
-    ### TABULATION
-    train_loader, val_loader = get_imagenette_video_loader_train_val_split(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        sequence_length=args.seq_len,
-    )
-    train_features, train_labels = next(iter(train_loader))
-    print(model.tabulate(jax.random.PRNGKey(64), train_features))
-    print()
 
     #### RESTORE
 
-    restored_state = checkpointer.restore(
+    explore_state = checkpointer.restore(
         # '/users/bkim53/code_directories/CSSM/checkpoints/vit_standard_d12_e384_v1/epoch_45',
-        '/users/bkim53/code_directories/CSSM/checkpoints/vit_standard_d12_e384/epoch_100',
+        '/Users/briankim/Documents/Research/OneVision/CepstralSSM.nosync/CSSM/checkpoints/vit_standard_d12_e384/epoch_100',
         target=state
         # abstract_my_tree
     )
-    # print(raw_restore)
 
-    # assert jax.tree_util.tree_all(jax.tree.map(lambda x, y: (x == y).all(), state.params, restored_state.params))
-    print(restored_state.params.keys())
-    print(restored_state.params['block11'].keys())
-    print(restored_state.params['block11']['cssm'].keys())
-    print(restored_state.params['block11']['cssm']['kernel'].shape)
-    print(variables['params'].keys())
-    print('perturbations' in variables)
-    # assert jax.tree_util.tree_all(jax.tree.map(lambda x, y: (x == y).all(), state.params, variables['params']))
-    # print(variables['perturbations'].keys())
+    # Get dataloaders
+    if args.create_act:
+        train_loader, val_loader = get_imagenette_video_loader_train_val_split(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            sequence_length=args.seq_len,
+            split="",
+            return_names=True,
+            class_sample_size=300,
+        )
 
-    val_metrics = evaluate(restored_state, val_loader, num_classes)
-    print(val_metrics)
+        train_activations, train_labels, train_names = extract_activations_with_capture(
+            explore_state, explore_state.params, train_loader,
+            ['block8', 'block9', 'block10', 'block11']
+        )
+        save_activations(train_activations, 'activations/train_cssmblocks_8_9_10_11.npz')
+        save_activations({"labels": train_labels}, 'activations/train_labels.npz')
+        save_activations({"names": train_names}, 'activations/train_names.npz')
+        val_activations, val_labels, val_names = extract_activations_with_capture(
+            explore_state, explore_state.params, val_loader,
+            ['block8', 'block9', 'block10', 'block11']
+        )
+        save_activations(val_activations, 'activations/val_cssmblocks_8_9_10_11.npz')
+        save_activations({"labels": val_labels}, 'activations/val_labels.npz')
+        save_activations({"names": val_names}, 'activations/val_names.npz')
+    elif args.act_train:
+        layer_name = 'block11'
 
-    # curr_image = train_features[None,0]
-    # curr_label = train_labels[None,0]
-    # display_prediction(restored_state, curr_image, curr_label)
-    sae_analyze(restored_state, train_features)
+        train_activations = load_activations(args.act_source)
+        layer_train_activations = train_activations['block11']
+        print("Layer activations:")
+        print(f"\tType: {type(layer_train_activations)}")
+        print(f"\tShape: {layer_train_activations.shape}")
+        sae_state, sae_model = train_sae_on_activations(layer_train_activations)
+        checkpointer.save(f"{args.act_save}_layer_{layer_name}_reshape", sae_state)
+    else:
+        feature_idx = 0
+        layer_name = 'block11'
+        d_sae = 8192
+
+        # Load validation activations
+        val_activations = load_activations(args.act_val_source)[layer_name]
+        val_labels = np.load(args.act_val_labels)['labels']
+        val_names = np.load(args.act_val_names, allow_pickle=True)['names']
+        print(val_activations.shape, val_labels.shape)
+        # print(val_labels[:5])
+        # print(val_names[:5])
+
+        num_samples = val_names.shape[0]
+        b_size = 8
+
+        # if len(val_activations.shape) > 2:
+        #     val_activations = jnp.reshape(val_activations, (-1, val_activations.shape[-1]))
+
+        # val_dataset_zipped = zip(val_activations, val_labels)
+        # val_dataset_zipped = list(zip(val_names, val_labels))
+
+        # Restore model
+        d_in = val_activations.shape[-1]
+        # d_in = val_names.shape[-1]
+        sae_model = SAE(d_in=d_in, d_sae=d_sae)
+        params = sae_model.init(rng, jnp.ones((1, d_in)))
+        tx = optax.adam(1e-3)
+        sae_state = train_state.TrainState.create(
+            apply_fn=sae_model.apply,
+            params=params,
+            tx=tx
+        )
+        restored_sae_state = checkpointer.restore(
+            # '/users/bkim53/code_directories/CSSM/checkpoints/vit_standard_d12_e384_v1/epoch_45',
+            '/Users/briankim/Documents/Research/OneVision/CepstralSSM.nosync/CSSM/checkpoints/sae_trained_layer_block11_reshape',
+            target=sae_state
+            # abstract_my_tree
+        )
+
+        # # Top-k images for a feature
+        # find_top_k_activating_images(
+        #     restored_sae_state, feature_idx,
+        #     explore_state, layer_name,
+        #     val_dataset
+        # )
+
+        # Pre-work Find alive features
+        feature_stats = find_alive_features(
+            restored_sae_state, explore_state, layer_name, val_names, d_sae, batch_size=b_size)
+        #     restored_sae_state, explore_state, layer_name, val_activations, d_sae)
+
+        # Random 20 features
+        random_20 = random_feature_sample(feature_stats['alive'], n=20)
+        print(f"Random 20: {random_20}")
+        for feat_idx in random_20:
+            analyze_and_document(
+                restored_sae_state, explore_state, layer_name, val_names, val_labels,
+                num_samples, feat_idx, batch_size=b_size, tag="random20")
+
+        # Top features by class
+        class_features = find_class_specific_features(
+            restored_sae_state, explore_state, layer_name, val_names, val_labels,
+            batch_size=b_size)
+        for class_name, features in class_features.items():
+            print(f"\n{class_name} features:")
+            print(f"\t{features[:5]}")
+            for feat_idx, _ in features[:5]:
+                analyze_and_document(
+                    restored_sae_state, explore_state, layer_name, val_names, val_labels,
+                    num_samples, feat_idx, batch_size=b_size, tag=f"topclass_{class_name}")
+
+        # Top 20 by activation
+        top_20 = features_by_max_activation(feature_stats, top_n=20)
+        print(f"Top 20: {top_20}")
+        for feat_idx in top_20:
+            analyze_and_document(
+                restored_sae_state, explore_state, layer_name, val_names, val_labels,
+                num_samples, feat_idx, batch_size=b_size, tag="top20act")
 
 
 if __name__ == '__main__':
