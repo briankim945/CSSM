@@ -1,0 +1,156 @@
+"""
+Optimizer factory for JAX/Flax training.
+
+Supports:
+- AdamW (default, good for most cases)
+- LAMB (used by DeiT III for large-batch training)
+- SGD with momentum (TIMM default)
+
+Uses official optax implementations.
+"""
+
+import optax
+from typing import Callable
+
+
+def create_optimizer(
+    optimizer_name: str,
+    learning_rate: float,
+    weight_decay: float = 0.05,
+    total_steps: int = 1000,
+    warmup_steps: int = 500,
+    grad_clip: float = 1.0,
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-6,
+) -> optax.GradientTransformation:
+    """
+    Factory function to create optimizers with learning rate schedule.
+
+    Args:
+        optimizer_name: 'adamw', 'lamb', or 'sgd'
+        learning_rate: Peak learning rate
+        weight_decay: Weight decay coefficient
+        total_steps: Total training steps
+        warmup_steps: Warmup steps
+        grad_clip: Gradient clipping norm
+        b1: Beta1 for Adam/LAMB (default: 0.9)
+        b2: Beta2 for Adam/LAMB (default: 0.999)
+        eps: Epsilon for numerical stability
+
+    Returns:
+        optax.GradientTransformation
+
+    Example DeiT III settings:
+        create_optimizer('lamb', lr=3e-3, weight_decay=0.05, ...)
+
+    Example TIMM settings:
+        create_optimizer('adamw', lr=1e-3, weight_decay=0.05, ...)
+    """
+    # Learning rate schedule: warmup + cosine decay
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=learning_rate,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps - warmup_steps,
+        end_value=learning_rate * 0.01,
+    )
+
+    if optimizer_name == 'adamw':
+        # AdamW: Adam with decoupled weight decay
+        # Good default for most vision transformers
+        return optax.chain(
+            optax.clip_by_global_norm(grad_clip),
+            optax.adamw(
+                learning_rate=schedule,
+                weight_decay=weight_decay,
+                b1=b1,
+                b2=b2,
+                eps=eps,
+            ),
+        )
+
+    elif optimizer_name == 'lamb':
+        # LAMB: Layer-wise Adaptive Moments for Batch training
+        # Used by DeiT III for large-batch training with high LR
+        # Reference: https://arxiv.org/abs/1904.00962
+        return optax.chain(
+            optax.clip_by_global_norm(grad_clip),
+            optax.lamb(
+                learning_rate=schedule,
+                weight_decay=weight_decay,
+                b1=b1,
+                b2=b2,
+                eps=eps,
+            ),
+        )
+
+    elif optimizer_name == 'sgd':
+        # SGD with momentum and Nesterov
+        # TIMM's default optimizer
+        return optax.chain(
+            optax.clip_by_global_norm(grad_clip),
+            optax.sgd(learning_rate=schedule, momentum=0.9, nesterov=True),
+            optax.add_decayed_weights(weight_decay),
+        )
+
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}. Choose from: adamw, lamb, sgd")
+
+
+def create_deit3_optimizer(
+    learning_rate: float = 3e-3,
+    weight_decay: float = 0.05,
+    total_steps: int = 1000,
+    warmup_steps: int = 500,
+    grad_clip: float = 1.0,
+) -> optax.GradientTransformation:
+    """
+    Create optimizer with DeiT III settings.
+
+    DeiT III uses LAMB optimizer with:
+    - Learning rate: 3e-3 to 4e-3
+    - Weight decay: 0.05
+    - 800 epochs
+    - Warmup: 5 epochs
+
+    Reference: https://arxiv.org/abs/2204.07118
+    """
+    return create_optimizer(
+        optimizer_name='lamb',
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        grad_clip=grad_clip,
+        b1=0.9,
+        b2=0.999,
+    )
+
+
+def create_timm_optimizer(
+    learning_rate: float = 1e-3,
+    weight_decay: float = 0.05,
+    total_steps: int = 1000,
+    warmup_steps: int = 500,
+    grad_clip: float = 1.0,
+) -> optax.GradientTransformation:
+    """
+    Create optimizer with TIMM-style settings.
+
+    TIMM typically uses AdamW with:
+    - Learning rate: 1e-3
+    - Weight decay: 0.05
+    - 300 epochs
+    - Warmup: 5 epochs
+    """
+    return create_optimizer(
+        optimizer_name='adamw',
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        grad_clip=grad_clip,
+        b1=0.9,
+        b2=0.999,
+    )
