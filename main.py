@@ -458,7 +458,7 @@ def main():
     elif args.arch == 'cssm_shvit':
         model = CSSMSHViT(
             num_classes=num_classes,
-            embed_dim=args.embed_dim,
+            # embed_dim=args.embed_dim,
             cssm_type=args.cssm,
             dense_mixing=(args.mixing == 'dense'),
             block_size=args.block_size,
