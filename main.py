@@ -34,6 +34,7 @@ from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
 from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit_small
 from src.models.deit3 import DeiT3Large, deit3_large_patch16_384, deit3_base_patch16_224
 from src.models.cssm_deit3 import CSSMDeiT3Large, cssm_deit3_large_patch16_384, cssm_deit3_base_patch16_224
+from src.models.cssm_shvit import CSSMSHViT
 from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenet_loader, get_imagenet_info
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info, get_pathfinder_tfrecord_loader
 
@@ -227,7 +228,7 @@ def main():
 
     # Architecture selection
     parser.add_argument('--arch', type=str,
-                        choices=['convnext', 'vit', 'baseline', 'deit3', 'cssm_deit3'],
+                        choices=['convnext', 'vit', 'baseline', 'deit3', 'cssm_deit3', 'cssm_shvit'],
                         default='convnext',
                         help='Architecture: convnext, vit (CSSM-ViT), baseline (ViT), deit3, cssm_deit3')
 
@@ -310,8 +311,6 @@ def main():
                         help='Evaluate every N epochs')
     parser.add_argument('--save_every', type=int, default=5,
                         help='Save checkpoint every N epochs')
-    parser.add_argument('--run_label', type=str, default=None,
-                        help='Any labels to add to the run name')                   
 
     # Data
     parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder', 'imagenet'], default='imagenette',
@@ -352,6 +351,8 @@ def main():
         elif args.arch == 'baseline':
             temporal_str = f"_temp{args.temporal_attn_every}" if not args.no_temporal_attn else "_notime"
             run_name = f"baseline_d{args.depth}_e{args.embed_dim}_h{args.num_heads}{temporal_str}"
+        if args.arch == 'cssm_shvit':
+            run_name = f"cssm_shvit_{args.cssm}_e{args.embed_dim}"
         else:
             run_name = f"{args.mode}_{args.cssm}_{args.mixing}"
 
@@ -453,6 +454,19 @@ def main():
             concat_xy=not args.no_concat_xy,
             gate_activation=args.gate_activation,
             num_timesteps=args.seq_len,
+        )
+    elif args.arch == 'cssm_shvit':
+        model = CSSMSHViT(
+            num_classes=num_classes,
+            embed_dim=args.embed_dim,
+            cssm_type=args.cssm,
+            dense_mixing=(args.mixing == 'dense'),
+            block_size=args.block_size,
+            gate_activation=args.gate_activation,
+            num_timesteps=args.seq_len,
+            rope_mode=args.rope_mode,
+            use_dwconv=args.use_dwconv,
+            output_act=args.output_act,
         )
     else:
         model = ModelFactory(
@@ -558,10 +572,11 @@ def main():
                 sequence_length=args.seq_len,
             )
         else:
-            train_loader, val_loader = get_imagenette_video_loader_train_val_split(
+            train_loader = get_imagenette_video_loader(
                 data_dir=args.data_dir,
                 batch_size=args.batch_size,
                 sequence_length=args.seq_len,
+                split='train',
             )
 
         # Training
