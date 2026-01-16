@@ -38,7 +38,7 @@ from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit
 from src.data import IMAGENETTE_CLASSES, load_image_val, get_dataset_info, get_imagenette_video_loader_train_val_split
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info
 from xai.sae_utils import extract_activations_with_capture, save_activations, train_sae_on_activations, \
-        load_activations, find_top_k_activating_images, SAE, \
+        load_activations, SparseCoder, \
         find_alive_features, find_class_specific_features, random_feature_sample, \
         features_by_max_activation, analyze_and_document
 
@@ -180,6 +180,10 @@ def main():
                         help='Location to val labels')
     parser.add_argument('--act_val_names', type=str, default='activations/val_names.npz',
                         help='Location to val names')
+    parser.add_argument('--transcoder', action='store_true',
+                        help='Flag to train a transcoder model')
+    parser.add_argument('--skip_connect', action='store_true',
+                        help='Flag to include a skip connection in the transcoder model')
     
     # Misc
     parser.add_argument('--seed', type=int, default=42,
@@ -249,6 +253,8 @@ def main():
         # abstract_my_tree
     )
 
+    lr = 1e-5
+
     # Get dataloaders
     if args.create_act:
         train_loader, val_loader = get_imagenette_video_loader_train_val_split(
@@ -275,19 +281,48 @@ def main():
         save_activations({"labels": val_labels}, 'activations/val_labels.npz')
         save_activations({"names": val_names}, 'activations/val_names.npz')
     elif args.act_train:
-        layer_name = 'block11'
+        if args.transcoder:
+            x_layer_name = 'block9'
+            y_layer_name = 'block11'
+            d_sae = 16384
 
-        train_activations = load_activations(args.act_source)
-        layer_train_activations = train_activations['block11']
-        print("Layer activations:")
-        print(f"\tType: {type(layer_train_activations)}")
-        print(f"\tShape: {layer_train_activations.shape}")
-        sae_state, sae_model = train_sae_on_activations(layer_train_activations)
-        checkpointer.save(f"{args.act_save}_layer_{layer_name}_reshape", sae_state)
+            train_activations = load_activations(args.act_source)
+            layer_act_inputs = train_activations[x_layer_name]
+            layer_act_targets = train_activations[y_layer_name]
+            print("Layer activations:")
+            print(f"\tType: {type(layer_act_inputs)}")
+            print(f"\tShape: {layer_act_inputs.shape}")
+            sae_state, sae_model = train_sae_on_activations(
+                layer_act_inputs,
+                y=layer_act_targets,
+                d_sae=d_sae,
+                transcode=True,
+                learning_rate=lr,
+                skip_connection=args.skip_connect,
+                num_epochs=20,
+            )
+            checkpointer.save(f"{args.act_save}_{d_sae}_layer_skip_connect_{args.skip_connect}_{x_layer_name}_to_{y_layer_name}_reshape", sae_state)
+        else:
+            layer_name = 'block11'
+
+            train_activations = load_activations(args.act_source)
+            layer_train_activations = train_activations['block11']
+            print("Layer activations:")
+            print(f"\tType: {type(layer_train_activations)}")
+            print(f"\tShape: {layer_train_activations.shape}")
+            sae_state, sae_model = train_sae_on_activations(layer_train_activations)
+            checkpointer.save(f"{args.act_save}_layer_{layer_name}_reshape", sae_state)
     else:
-        feature_idx = 0
-        layer_name = 'block11'
-        d_sae = 8192
+        if args.transcoder:
+            x_layer_name = 'block9'
+            y_layer_name = 'block11'
+            layer_name = 'block8'
+            s_dir = 'feature_reports/transcoder'
+            d_sae = 8192
+        else:
+            layer_name = 'block11'
+            s_dir = 'feature_reports'
+            d_sae = 8192
 
         # Load validation activations
         val_activations = load_activations(args.act_val_source)[layer_name]
@@ -309,20 +344,30 @@ def main():
         # Restore model
         d_in = val_activations.shape[-1]
         # d_in = val_names.shape[-1]
-        sae_model = SAE(d_in=d_in, d_sae=d_sae)
+        # sae_model = SAE(d_in=d_in, d_sae=d_sae)
+        k_features = 32
+        sae_model = SparseCoder(d_in, d_sae, k=k_features)
         params = sae_model.init(rng, jnp.ones((1, d_in)))
-        tx = optax.adam(1e-3)
+        tx = optax.adam(lr)
         sae_state = train_state.TrainState.create(
             apply_fn=sae_model.apply,
             params=params,
             tx=tx
         )
-        restored_sae_state = checkpointer.restore(
-            # '/users/bkim53/code_directories/CSSM/checkpoints/vit_standard_d12_e384_v1/epoch_45',
-            '/Users/briankim/Documents/Research/OneVision/CepstralSSM.nosync/CSSM/checkpoints/sae_trained_layer_block11_reshape',
-            target=sae_state
-            # abstract_my_tree
-        )
+        if args.transcoder:
+            restored_sae_state = checkpointer.restore(
+                # '/users/bkim53/code_directories/CSSM/checkpoints/vit_standard_d12_e384_v1/epoch_45',
+                f'/Users/briankim/Documents/Research/OneVision/CepstralSSM.nosync/CSSM/checkpoints/transcoder_trained_layer_{x_layer_name}_to_{y_layer_name}_reshape',
+                target=sae_state
+                # abstract_my_tree
+            )
+        else:
+            restored_sae_state = checkpointer.restore(
+                # '/users/bkim53/code_directories/CSSM/checkpoints/vit_standard_d12_e384_v1/epoch_45',
+                '/Users/briankim/Documents/Research/OneVision/CepstralSSM.nosync/CSSM/checkpoints/sparsecoder_trained_layer_block11_reshape',
+                target=sae_state
+                # abstract_my_tree
+            )
 
         # # Top-k images for a feature
         # find_top_k_activating_images(
@@ -332,6 +377,8 @@ def main():
         # )
 
         # Pre-work Find alive features
+        # feature_stats = find_alive_features(
+        #     restored_sae_state, explore_state, layer_name, val_names, k_features, batch_size=b_size)
         feature_stats = find_alive_features(
             restored_sae_state, explore_state, layer_name, val_names, d_sae, batch_size=b_size)
         #     restored_sae_state, explore_state, layer_name, val_activations, d_sae)
@@ -342,7 +389,7 @@ def main():
         for feat_idx in random_20:
             analyze_and_document(
                 restored_sae_state, explore_state, layer_name, val_names, val_labels,
-                num_samples, feat_idx, batch_size=b_size, tag="random20")
+                num_samples, feat_idx, save_dir=s_dir, batch_size=b_size, tag="random20")
 
         # Top features by class
         class_features = find_class_specific_features(
@@ -354,7 +401,7 @@ def main():
             for feat_idx, _ in features[:5]:
                 analyze_and_document(
                     restored_sae_state, explore_state, layer_name, val_names, val_labels,
-                    num_samples, feat_idx, batch_size=b_size, tag=f"topclass_{class_name}")
+                    num_samples, feat_idx, save_dir=s_dir, batch_size=b_size, tag=f"topclass_{class_name}")
 
         # Top 20 by activation
         top_20 = features_by_max_activation(feature_stats, top_n=20)
@@ -362,7 +409,7 @@ def main():
         for feat_idx in top_20:
             analyze_and_document(
                 restored_sae_state, explore_state, layer_name, val_names, val_labels,
-                num_samples, feat_idx, batch_size=b_size, tag="top20act")
+                num_samples, feat_idx, save_dir=s_dir, batch_size=b_size, tag="top20act")
 
 
 if __name__ == '__main__':

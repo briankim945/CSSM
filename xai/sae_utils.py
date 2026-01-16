@@ -6,6 +6,7 @@ import optax
 import numpy as np
 import math
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import cv2
 from pathlib import Path
 from collections import defaultdict
@@ -14,47 +15,230 @@ import sys, os
 
 from src.data import VideoDataLoader, load_image_val, restore_image
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, NamedTuple, Literal
 
 
-class SAE(nn.Module):
-    """Minimal SAE for computer vision activations."""
-    d_in: int
-    d_sae: int
+class EncoderOutput(NamedTuple):
+    top_acts: jnp.ndarray      # Activations of the top-k latents
+    top_indices: jnp.ndarray   # Indices of the top-k features
+    pre_acts: jnp.ndarray      # Activations before top-k selection
+
+
+class ForwardOutput(NamedTuple):
+    sae_out: jnp.ndarray
+    latent_acts: jnp.ndarray
+    latent_indices: jnp.ndarray
+    fvu: jnp.ndarray
+    auxk_loss: jnp.ndarray
+    multi_topk_fvu: jnp.ndarray
+    unordered_latent_acts: jnp.ndarray
+
+
+class SparseCoder(nn.Module):
+    """
+    Sparse Autoencoder / Transcoder in JAX/Flax.
     
-    @nn.compact
-    def __call__(self, x):
-        # Decoder bias (learned)
-        b_dec = self.param('b_dec', nn.initializers.zeros, (self.d_in,))
+    NOTE: "groupmax" activation is not yet implemented. Only "topk" is supported.
+    TODO: Implement groupmax activation for parity with PyTorch version.
+    """
+    d_in: int
+    num_latents: int | None = None
+    expansion_factor: int = 32
+    k: int = 32
+    activation: Literal["topk"] = "topk"  # TODO: Add "groupmax" support
+    normalize_decoder: bool = True
+    transcode: bool = False
+    multi_topk: bool = False
+    skip_connection: bool = False
+
+    def setup(self):
+        self._num_latents = self.num_latents or self.d_in * self.expansion_factor
+
+        # Encoder: Linear layer (weight shape: [d_in, num_latents] in Flax convention)
+        self.encoder = nn.Dense(
+            self._num_latents,
+            use_bias=True,
+            kernel_init=nn.initializers.lecun_normal(),
+            bias_init=nn.initializers.zeros,
+        )
+
+        # Decoder weight: [num_latents, d_in]
+        if self.transcode:
+            self.W_dec = self.param(
+                "W_dec",
+                nn.initializers.zeros,
+                (self._num_latents, self.d_in),
+            )
+        else:
+            # Initialize to match encoder weights (transposed)
+            # In Flax, Dense kernel is [d_in, num_latents], so we transpose
+            self.W_dec = self.param(
+                "W_dec",
+                nn.initializers.lecun_normal(),
+                (self._num_latents, self.d_in),
+            )
+
+        # Decoder bias
+        self.b_dec = self.param("b_dec", nn.initializers.zeros, (self.d_in,))
+
+        # Optional skip connection: [d_in, d_in]
+        if self.skip_connection:
+            self.W_skip = self.param(
+                "W_skip",
+                nn.initializers.zeros,
+                (self.d_in, self.d_in),
+            )
+
+    def encode(self, x: jnp.ndarray) -> EncoderOutput:
+        """Encode input and select top-k latents."""
+        if not self.transcode:
+            x = x - self.b_dec
+
+        # Linear + ReLU
+        pre_acts = nn.relu(self.encoder(x))
+
+        # Top-k selection
+        if self.activation == "topk":
+            top_acts, top_indices = jax.lax.top_k(pre_acts, self.k)
+        else:
+            # TODO: Implement groupmax
+            # For groupmax, the logic would be:
+            #   1. Reshape pre_acts to [..., k, num_latents // k]
+            #   2. Take max along last dimension to get top_acts
+            #   3. Compute indices by adding group offsets to argmax indices
+            raise NotImplementedError(
+                f"Activation '{self.activation}' not implemented. Only 'topk' is currently supported."
+            )
+
+        return EncoderOutput(top_acts, top_indices, pre_acts)
+
+    def decode(self, top_acts: jnp.ndarray, top_indices: jnp.ndarray) -> jnp.ndarray:
+        """Decode from sparse latent representation."""
+        # Gather decoder weights for active latents
+        # W_dec shape: [num_latents, d_in]
+        # top_indices shape: [..., k]
+        # top_acts shape: [..., k]
+
+        # Gather: [..., k, d_in]
+        gathered = self.W_dec[top_indices]
+
+        # Weighted sum over k dimension: [..., d_in]
+        y = jnp.einsum("...k,...kd->...d", top_acts, gathered)
+
+        return y + self.b_dec
+
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        y: jnp.ndarray | None = None,
+        dead_mask: jnp.ndarray | None = None,
+    ) -> ForwardOutput:
+        """
+        Forward pass with optional training losses.
         
-        # Encoder
-        x_centered = x - b_dec
-        W_enc = self.param('W_enc', nn.initializers.xavier_uniform(), 
-                          (self.d_in, self.d_sae))
-        b_enc = self.param('b_enc', nn.initializers.zeros, (self.d_sae,))
-        features = nn.relu(jnp.dot(x_centered, W_enc) + b_enc)
+        Args:
+            x: Input tensor of shape [batch, d_in]
+            y: Optional target tensor for transcoding. If None, uses x (autoencoding).
+            dead_mask: Optional boolean mask of shape [num_latents] indicating dead features.
+                       Only needed during training for auxk loss computation.
         
-        # Decoder (tied weights)
-        reconstruction = jnp.dot(features, W_enc.T) + b_dec
-        
-        return features, reconstruction
+        Returns:
+            ForwardOutput containing reconstruction and training metrics.
+            For inference, you can ignore fvu, auxk_loss, and multi_topk_fvu.
+        """
+        top_acts, top_indices, pre_acts = self.encode(x)
+
+        # Default target is input (autoencoding)
+        if y is None:
+            y = x
+
+        # Decode
+        sae_out = self.decode(top_acts, top_indices)
+
+        # Optional skip connection
+        if self.skip_connection:
+            sae_out = sae_out + x @ self.W_skip.T
+
+        # Residual
+        e = y - sae_out
+
+        # Variance for normalization
+        total_variance = jnp.sum((y - y.mean(axis=0)) ** 2)
+
+        # AuxK loss for dead features
+        if dead_mask is not None:
+            num_dead = jnp.sum(dead_mask).astype(jnp.int32)
+            k_aux = y.shape[-1] // 2
+
+            # Compute auxk loss only if there are dead features
+            def compute_auxk_loss():
+                k_aux_actual = jnp.minimum(k_aux, num_dead)
+                scale = jnp.minimum(num_dead / k_aux, 1.0)
+
+                # Mask out living latents (set to -inf so they're never selected)
+                auxk_latents = jnp.where(dead_mask[None], pre_acts, -jnp.inf)
+                
+                # Select top-k_aux dead latents
+                # Note: k_aux_actual must be static for top_k, so we use k_aux as upper bound
+                auxk_acts, auxk_indices = jax.lax.top_k(auxk_latents, k_aux)
+
+                e_hat = self.decode(auxk_acts, auxk_indices)
+                loss = jnp.sum((e_hat - jax.lax.stop_gradient(e)) ** 2)
+                return scale * loss / total_variance
+
+            auxk_loss = jax.lax.cond(
+                num_dead > 0,
+                compute_auxk_loss,
+                lambda: jnp.array(0.0),
+            )
+        else:
+            auxk_loss = jnp.array(0.0)
+
+        # FVU (fraction of variance unexplained)
+        l2_loss = jnp.sum(e ** 2)
+        fvu = l2_loss / total_variance
+
+        # Multi-TopK FVU
+        if self.multi_topk:
+            top_acts_multi, top_indices_multi = jax.lax.top_k(pre_acts, 4 * self.k)
+            sae_out_multi = self.decode(top_acts_multi, top_indices_multi)
+            multi_topk_fvu = jnp.sum((sae_out_multi - y) ** 2) / total_variance
+        else:
+            multi_topk_fvu = jnp.array(0.0)
+
+        return ForwardOutput(
+            sae_out=sae_out,
+            latent_acts=top_acts,
+            latent_indices=top_indices,
+            fvu=fvu,
+            auxk_loss=auxk_loss,
+            multi_topk_fvu=multi_topk_fvu,
+            unordered_latent_acts=pre_acts,
+        )
 
 
 def train_sae_on_activations(
-    cnn_activations: jnp.ndarray,  # [N, d_in]
+    activations: jnp.ndarray,  # [N, d_in]
+    y: jnp.ndarray = None,
     d_sae: int = 8192,
     sparsity_coef: float = 0.01,
     num_epochs: int = 10,
     batch_size: int = 64,
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-3,
+    transcode: bool = False,
+    skip_connection: bool = False,
 ):
     """Train SAE on CNN activations."""
     
-    d_in = cnn_activations.shape[-1]
+    d_in = activations.shape[-1]
     
     # Initialize model
     rng = jax.random.PRNGKey(0)
-    model = SAE(d_in=d_in, d_sae=d_sae)
+    # model = SAE(d_in=d_in, d_sae=d_sae)
+    if transcode:
+        model = SparseCoder(d_in, d_sae, transcode=transcode, skip_connection=skip_connection)
+    else:
+        model = SparseCoder(d_in, d_sae)
     params = model.init(rng, jnp.ones((1, d_in)))
     
     # Create optimizer
@@ -67,16 +251,18 @@ def train_sae_on_activations(
     
     # Training loop
     @jax.jit
-    def train_step(state, batch):
+    def train_step(state, batch, dead_mask=None, auxk_alpha=sparsity_coef, y=None):
         def loss_fn(params):
-            features, recon = state.apply_fn(params, batch)
-            recon_loss = jnp.mean((batch - recon) ** 2)
-            sparsity_loss = jnp.mean(jnp.abs(features))
-            total_loss = recon_loss + sparsity_coef * sparsity_loss
+            output = state.apply_fn(params, batch, y=y, dead_mask=dead_mask)
+            # features, recon = state.apply_fn(params, batch)
+            recon_loss = jnp.mean((batch - output.sae_out) ** 2)
+            sparsity_loss = jnp.mean(jnp.abs(output.latent_acts))
+            total_loss = output.fvu + auxk_alpha * output.auxk_loss
+            # total_loss = recon_loss + sparsity_coef * sparsity_loss
             return total_loss, {
                 'recon': recon_loss,
                 'sparsity': sparsity_loss,
-                'active': jnp.mean(features > 0)
+                'active': jnp.mean(output.latent_acts > 0)
             }
         
         (loss, metrics), grads = jax.value_and_grad(
@@ -87,21 +273,30 @@ def train_sae_on_activations(
         return state, loss, metrics
     
     # Handle reshaping for SAE
-    if len(cnn_activations.shape) > 2:
-        cnn_activations = jnp.reshape(cnn_activations, (-1, cnn_activations.shape[-1]))
+    if len(activations.shape) > 2:
+        activations = jnp.reshape(activations, (-1, activations.shape[-1]))
+
+    if y is not None and len(y.shape) > 2:
+        y = jnp.reshape(y, (-1, y.shape[-1]))
+
+    assert activations.shape == y.shape, f"{activations.shape} does not match {y.shape}"
     
     # Train
-    num_samples = cnn_activations.shape[0]
+    num_samples = activations.shape[0]
     for epoch in range(num_epochs):
         # Shuffle data
         perm = jax.random.permutation(rng, num_samples)
-        activations_shuffled = cnn_activations[perm]
+        activations_shuffled = activations[perm]
+        if y is not None:
+            y = y[perm]
         
         # Batch training
         for i in tqdm(range(0, num_samples, batch_size)):
             batch = activations_shuffled[i:i+batch_size]
+            if y is not None:
+                y_batch = y[i:i+batch_size]
 
-            state, loss, metrics = train_step(state, batch)
+            state, loss, metrics = train_step(state, batch, y=y_batch)
         
         print(f"Epoch {epoch}: Loss={loss:.4f}, "
               f"Active={metrics['active']:.2%}")
@@ -231,59 +426,6 @@ def load_activations(load_path: str) -> Dict[str, np.ndarray]:
     return {key: data[key] for key in data.keys()}
 
 
-# def prepare_activations_for_sae(
-#     activations: np.ndarray,
-#     method: str = 'spatial_flatten'
-# ) -> Tuple[np.ndarray, Dict]:
-#     """
-#     Prepare conv activations for SAE training.
-    
-#     Args:
-#         activations: Raw activations [N, H, W, C] or [N, C]
-#         method: 'spatial_flatten', 'global_pool', or 'keep_spatial'
-    
-#     Returns:
-#         Prepared activations and metadata
-#     """
-#     original_shape = activations.shape
-    
-#     if method == 'spatial_flatten':
-#         # Treat each spatial location as separate sample
-#         if len(activations.shape) == 4:
-#             N, H, W, C = activations.shape
-#             prepared = activations.reshape(N * H * W, C)
-#             metadata = {
-#                 'method': 'spatial_flatten',
-#                 'original_shape': original_shape,
-#                 'num_spatial_locations': H * W
-#             }
-#         else:
-#             prepared = activations
-#             metadata = {'method': 'already_flat'}
-    
-#     elif method == 'global_pool':
-#         # Average across spatial dimensions
-#         if len(activations.shape) == 4:
-#             prepared = np.mean(activations, axis=(1, 2))
-#             metadata = {
-#                 'method': 'global_pool',
-#                 'original_shape': original_shape
-#             }
-#         else:
-#             prepared = activations
-#             metadata = {'method': 'already_flat'}
-    
-#     else:
-#         raise ValueError(f"Unknown method: {method}")
-    
-#     print(f"\nPrepared activations for SAE:")
-#     print(f"  Original shape: {original_shape}")
-#     print(f"  Prepared shape: {prepared.shape}")
-#     print(f"  Method: {metadata['method']}")
-    
-#     return prepared, metadata
-
-
 def find_alive_features(
     sae_state, 
     target_state,
@@ -314,15 +456,18 @@ def find_alive_features(
         # Get activations
         acts = extract_activations(target_state, target_state.params, images, target_layer)
         acts_flat = jnp.reshape(acts, (-1, acts.shape[-1]))
-        sae_features, _ = sae_state.apply_fn(sae_state.params, acts_flat)  # [batch, num_features]
-        
+        # sae_features, _ = sae_state.apply_fn(sae_state.params, acts_flat)  # [batch, num_features]
+        output = sae_state.apply_fn(sae_state.params, acts_flat)
+        # sae_features = output.latent_acts
+        sae_features = output.unordered_latent_acts
+
         # Track statistics
         feature_max_activations = np.maximum(
             feature_max_activations,
             sae_features.max(axis=0)
         )
         feature_mean_activations += sae_features.sum(axis=0)
-        feature_activation_frequency += (sae_features > 0.1).sum(axis=0)
+        feature_activation_frequency += (sae_features > threshold).sum(axis=0)
         
         total_samples += len(images)
     
@@ -391,7 +536,9 @@ def find_class_specific_features(
         images = extract_and_create_im_seqs(locs)
         acts = extract_activations(target_state, target_state.params, images, target_layer)
         acts_flat = jnp.reshape(acts, (-1, acts.shape[-1]))
-        sae_features, _ = sae_state.apply_fn(sae_state.params, acts_flat)
+        # sae_features, _ = sae_state.apply_fn(sae_state.params, acts_flat)
+        output = sae_state.apply_fn(sae_state.params, acts_flat)
+        sae_features = output.unordered_latent_acts
         
         for feat_vec, label in zip(sae_features, labels):
             features_by_class[label].append(feat_vec)
@@ -519,6 +666,7 @@ def find_top_k_with_metadata(all_activations, all_metadata, k=20):
             'activation': float(all_activations[idx]),
             'batch_idx': metadata['batch_idx'],
             'image_idx': metadata['image_idx'],
+            'time_step': metadata['time_step'],
             'label': metadata['image_label'],
             'spatial_location': (metadata['spatial_h'], metadata['spatial_w']),
             'global_idx': metadata['global_idx']
@@ -549,6 +697,7 @@ def find_top_k_with_metadata(all_activations, all_metadata, k=20):
             'activation': float(all_activations[idx]),
             'spatial_h': metadata['spatial_h'],
             'spatial_w': metadata['spatial_w'],
+            'time_step': metadata['time_step'],
             'label': metadata['image_label']
         })
     
@@ -565,7 +714,8 @@ def find_top_k_with_metadata(all_activations, all_metadata, k=20):
             'image_idx': image_key[1],
             'max_activation': max_activation,
             'max_location': (acts_list[max_idx]['spatial_h'], 
-                           acts_list[max_idx]['spatial_w']),
+                           acts_list[max_idx]['spatial_w'],
+                           acts_list[max_idx]['time_step']),
             'mean_activation': np.mean(activations),
             'num_active_locations': sum(1 for a in activations if a > 0.1),
             'total_locations': sum(1 for _ in activations),
@@ -615,8 +765,15 @@ def visualize_top_k_with_spatial_info(
         fig, axes = plt.subplots(rows, cols * 2, figsize=(4 * cols * 2, 4 * rows))
     else:
         fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
-    
-    for idx_super, ax in enumerate(axes.flat):
+
+    axes = axes.flatten()
+
+    # Carrier for video sequences
+    sequences = []
+    images = []
+
+    # for idx_super, ax in enumerate(axes.flat):
+    for idx_super, ax in enumerate(axes):
         if first_only:
             if pair_show:
                 idx = idx_super // 2
@@ -631,34 +788,45 @@ def visualize_top_k_with_spatial_info(
             
             # Retrieve image
             image = retrieve_image_from_metadata(dataset, img_info, batch_size=batch_size)
-            if len(image.shape) == 4:
+            if len(image.shape) == 4: # Get only first image for now
                 image = image[0]
             
             # Get spatial activations for this image
             spatial_acts = img_info['all_spatial_activations']
+
+            # Create spatiotemporal map
+            spatiotemporal_map = np.zeros((t_count, h_count, w_count))
             
             # Reconstruct spatial map
-            spatial_map = np.zeros((h_count, w_count))
+            # spatial_map = np.zeros((h_count, w_count))
             for act_info in spatial_acts:
-                h, w = act_info['spatial_h'], act_info['spatial_w']
-                if h is not None and w is not None:
-                    spatial_map[h, w] = act_info['activation']
+                t, h, w = act_info['time_step'], act_info['spatial_h'], act_info['spatial_w']
+                if t is not None and h is not None and w is not None:
+                    spatiotemporal_map[t, h, w] = act_info['activation']
 
-            # # Fix for valid image value range
-            # spatial_map = np.maximum(spatial_map, 0)
-            # spatial_map = (spatial_map - spatial_map.min()) / (spatial_map.max() - spatial_map.min() + 1e-8)
+            # for t in range(t_count):
+            #     # Fix for valid image value range
+            #     spatiotemporal_map[t] = np.maximum(spatiotemporal_map[t], 0)
+            #     spatiotemporal_map[t] = (spatiotemporal_map[t] - spatiotemporal_map[t].min()) / (spatiotemporal_map[t].max() - spatiotemporal_map[t].min() + 1e-8)
 
-            # Upsample spatial map to image size
-            spatial_map_upsampled = cv2.resize(
-                spatial_map,
-                (image.shape[1], image.shape[0]),
-                interpolation=cv2.INTER_LINEAR
-            )
+            spatiotemporal_maps_upsampled = []
+
+            for t in range(t_count):
+                # Upsample spatial map to image size
+                spatial_map_upsampled = cv2.resize(
+                    spatiotemporal_map[t],
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_LINEAR
+                )
+                spatiotemporal_maps_upsampled.append(spatial_map_upsampled)
+
+            sequences.append(spatiotemporal_maps_upsampled)
+            images.append([restore_image(image) for _ in range(t_count)])
             
-            # Display
-            ax.imshow(restore_image(image))
-            if (pair_show and idx_super % 2 == 1) or not pair_show:
-                ax.imshow(spatial_map_upsampled, alpha=0.5, cmap='hot', vmin=0, vmax=1)
+            # # Display
+            # ax.imshow(restore_image(image))
+            # if (pair_show and idx_super % 2 == 1) or not pair_show:
+            #     ax.imshow(spatial_map_upsampled, alpha=0.5, cmap='hot', vmin=0, vmax=1)
             
             # Title with information
             ax.set_title(
@@ -671,15 +839,60 @@ def visualize_top_k_with_spatial_info(
             ax.axis('off')
         else:
             raise(NotImplementedError('Not yet implemented'))
+        
+    # ims = []
+
+    # Initialize axes
+    for i, seq in enumerate(sequences):
+        ax = axes[i]
+        ax.imshow(seq[0], animated=True)
+        # ax.set_title(
+        #     f"#{idx+1}: {img_info['label']}\n"
+        #     f"Max={img_info['max_activation']:.2f} at "
+        #     f"({img_info['max_location'][0]},{img_info['max_location'][1]})\n"
+        #     f"Active: {img_info['num_active_locations']}/{h_count * w_count}",
+        #     fontsize=10
+        # )
+        # axes[i].axis('off')
+        # ims.append(im)
+
+    def animate(frame):
+        for idx, (im, seq) in enumerate(zip(images, sequences)):
+            ax = axes[idx]
+            ax.clear()
+
+            # Display
+            # ax.imshow(restore_image(image))
+            ax.imshow(im[frame], animated=True)
+            if (pair_show and idx % 2 == 1) or not pair_show:
+                ax.imshow(seq[frame], alpha=0.5, cmap='hot', vmin=0, vmax=1)
+            
+            # Title with information
+            ax.set_title(
+                f"#{idx+1}: {img_info['label']}\n"
+                f"Max={img_info['max_activation']:.2f} at "
+                f"({img_info['max_location'][0]},{img_info['max_location'][1]})\n"
+                f"Active: {img_info['num_active_locations']}/{h_count * w_count}\n"
+                f"at timestep {frame}",
+                fontsize=10
+            )
+        return []
     
     fig.suptitle(
         f"Feature {feature_idx} - Top {len(top_k_images)} Images with Spatial Activations",
         fontsize=16,
         fontweight='bold'
     )
+
+    ani = animation.FuncAnimation(
+        fig, animate,
+        frames=t_count,
+        interval=100,
+        blit=True
+    )
     
     plt.tight_layout()
-    return fig
+    return ani, fig
 
 
 def save_feature_analysis_with_metadata(
@@ -730,7 +943,7 @@ def save_feature_analysis_with_metadata(
         # Only save top activations for retrieval
     }
     
-    json_path = save_dir / f'{feature_idx:04d}_{tag}' / f'feature_{feature_idx:04d}_metadata.json'
+    json_path = save_dir / f'{tag}_{feature_idx:04d}' / f'feature_{feature_idx:04d}_metadata.json'
     with open(json_path, 'w') as f:
         json.dump(report, indent=2, fp=f)
     
@@ -768,7 +981,7 @@ def load_and_visualize_saved_feature(feature_idx, dataset, save_dir='feature_rep
         plt.show()
 
 
-def create_spatial_visualization(image, spatial_map, feature_idx, img_info):
+def create_spatial_visualization(image, spatiotemporal_map, feature_idx, img_info):
     """
     Create a comprehensive spatial visualization showing:
     1. Original image
@@ -788,70 +1001,75 @@ def create_spatial_visualization(image, spatial_map, feature_idx, img_info):
     import cv2
     
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    
-    # ========================================================================
-    # Panel 1: Original Image
-    # ========================================================================
-    axes[0].imshow(restore_image(image))
-    axes[0].set_title('Original Image', fontsize=12, fontweight='bold')
-    axes[0].axis('off')
-    
-    # ========================================================================
-    # Panel 2: Spatial Activation Heatmap
-    # ========================================================================
-    # spatial_map = np.maximum(spatial_map, 0)
-    # spatial_map = (spatial_map - spatial_map.min()) / (spatial_map.max() - spatial_map.min() + 1e-8)
-    im = axes[1].imshow(spatial_map, cmap='hot', interpolation='nearest')
-    axes[1].set_title(
-        f'Feature {feature_idx} Activation Map\n'
-        f'Max: {img_info["max_activation"]:.3f} at '
-        f'{img_info["max_location"]}',
-        fontsize=12,
-        fontweight='bold'
-    )
-    
-    # Add grid lines to show spatial structure
-    axes[1].set_xticks(np.arange(spatial_map.shape[1]))
-    axes[1].set_yticks(np.arange(spatial_map.shape[0]))
-    axes[1].grid(which='both', color='white', linestyle='-', linewidth=0.5, alpha=0.3)
-    
+
     # Mark the maximum activation location
-    max_h, max_w = img_info['max_location']
-    if max_h is not None and max_w is not None:
-        axes[1].plot(max_w, max_h, 'r*', markersize=20, 
-                    markeredgecolor='white', markeredgewidth=2)
+    max_t, max_h, max_w = img_info['max_location']
     
-    # Colorbar
-    plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
-    
-    # ========================================================================
-    # Panel 3: Overlay on Original Image
-    # ========================================================================
-    # Upsample spatial map to match image resolution
-    spatial_map_upsampled = cv2.resize(
-        spatial_map,
-        (image.shape[1], image.shape[0]),
-        interpolation=cv2.INTER_LINEAR
-    )
-    
-    # Normalize image to [0, 1] if needed
-    if image.max() > 1.0:
-        image_normalized = image / 255.0
-    else:
-        image_normalized = image
-    
-    # Create overlay
-    axes[2].imshow(restore_image(image_normalized))
-    axes[2].imshow(spatial_map_upsampled, alpha=0.5, cmap='hot', 
-                  vmin=0, vmax=spatial_map.max())
-    axes[2].set_title(
-        f'Overlay\n'
-        f'Label: {img_info["label"]}, '
-        f'Mean: {img_info["mean_activation"]:.3f}',
-        fontsize=12,
-        fontweight='bold'
-    )
-    axes[2].axis('off')
+    def set_axes(image, spatial_map, t, init=False):
+        # ========================================================================
+        # Panel 1: Original Image
+        # ========================================================================
+        axes[0].imshow(restore_image(image), animated=True)
+        axes[0].set_title('Original Image', fontsize=12, fontweight='bold')
+        axes[0].axis('off')
+        
+        # ========================================================================
+        # Panel 2: Spatial Activation Heatmap
+        # ========================================================================
+        # spatial_map = np.maximum(spatial_map, 0)
+        # spatial_map = (spatial_map - spatial_map.min()) / (spatial_map.max() - spatial_map.min() + 1e-8)
+        im1 = axes[1].imshow(spatial_map, cmap='hot', interpolation='nearest', animated=True)
+        axes[1].set_title(
+            f'Feature {feature_idx} Activation Map\n'
+            f'Max: {img_info["max_activation"]:.3f} at '
+            f'{img_info["max_location"]} at timestep {t}',
+            fontsize=12,
+            fontweight='bold'
+        )
+        
+        # Add grid lines to show spatial structure
+        axes[1].set_xticks(np.arange(spatial_map.shape[1]))
+        axes[1].set_yticks(np.arange(spatial_map.shape[0]))
+        axes[1].grid(which='both', color='white', linestyle='-', linewidth=0.5, alpha=0.3)
+
+        if max_t is not None and max_h is not None and max_w is not None and t == max_t:
+            axes[1].plot(max_w, max_h, 'r*', markersize=20, 
+                        markeredgecolor='white', markeredgewidth=2)
+        
+        # Colorbar
+        if init:
+            plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        
+        # ========================================================================
+        # Panel 3: Overlay on Original Image
+        # ========================================================================
+        # Upsample spatial map to match image resolution
+        spatial_map_upsampled = cv2.resize(
+            spatial_map,
+            (image.shape[1], image.shape[0]),
+            interpolation=cv2.INTER_LINEAR
+        )
+        
+        # Normalize image to [0, 1] if needed
+        if image.max() > 1.0:
+            image_normalized = image / 255.0
+        else:
+            image_normalized = image
+        
+        # Create overlay
+        axes[2].imshow(restore_image(image_normalized), animated=True)
+        axes[2].imshow(spatial_map_upsampled, alpha=0.5, cmap='hot', 
+                    vmin=0, vmax=spatial_map.max(), animated=True)
+        axes[2].set_title(
+            f'Overlay\n'
+            f'Label: {img_info["label"]}, '
+            f'Mean: {img_info["mean_activation"]:.3f}',
+            fontsize=12,
+            fontweight='bold'
+        )
+        axes[2].axis('off')
+
+    set_axes(image, spatiotemporal_map[0], 0, init=True)
     
     # Overall title
     fig.suptitle(
@@ -861,10 +1079,25 @@ def create_spatial_visualization(image, spatial_map, feature_idx, img_info):
         fontweight='bold',
         y=1.02
     )
+
+    def animate(frame):
+        for i in range(3):
+            ax = axes[i]
+            ax.clear()
+        set_axes(image, spatiotemporal_map[frame], frame)
+        
+        return []
+    
+    ani = animation.FuncAnimation(
+        fig, animate,
+        frames=spatiotemporal_map.shape[0],
+        interval=100,  # milliseconds between frames
+        blit=False
+    )
     
     plt.tight_layout()
     
-    return fig
+    return ani, fig
 
 
 def visualize_feature_spatial_activation(
@@ -935,6 +1168,7 @@ def analyze_and_document(
     save_dir='feature_reports',
     k_top_images=20,
     batch_size=64,
+    t_count=8,
     tag="default",
 ):
     """
@@ -981,7 +1215,9 @@ def analyze_and_document(
         acts_flat = acts.reshape(-1, acts.shape[-1])
         
         # Get SAE features
-        sae_features, _ = sae_state.apply_fn(sae_state.params, acts_flat)
+        # sae_features, _ = sae_state.apply_fn(sae_state.params, acts_flat)
+        output = sae_state.apply_fn(sae_state.params, acts_flat)
+        sae_features = output.unordered_latent_acts
         feature_acts = sae_features[:, feature_idx]
 
         # Repeat labels for each SAE feature
@@ -1130,9 +1366,9 @@ def analyze_and_document(
     #     rows=4,
     #     cols=5
     # )
-    fig = visualize_top_k_with_spatial_info(
-        dataset, top_k_images, feature_idx, h_count=H, w_count=W, batch_size=batch_size,
-        pair_show=True
+    ani, fig = visualize_top_k_with_spatial_info(
+        dataset, top_k_images, feature_idx, h_count=H, w_count=W, t_count=t_count,
+        batch_size=batch_size, pair_show=True
     )
 
     # Retrieve actual images
@@ -1142,10 +1378,12 @@ def analyze_and_document(
         top_images_list.append(image)
     
     # Save visualization
-    fig_path = save_dir / f'{feature_idx:04d}_{tag}' / f'feature_{feature_idx:04d}_topk.png'
-    os.makedirs(save_dir / f'{feature_idx:04d}_{tag}', exist_ok=True)
-    fig.savefig(fig_path, dpi=150, bbox_inches='tight')
+    fig_path = save_dir / f'{tag}_{feature_idx:04d}' / f'feature_{feature_idx:04d}_topk.gif'
+    os.makedirs(save_dir / f'{tag}_{feature_idx:04d}', exist_ok=True)
+    # ani.save(fig_path, dpi=150, bbox_inches='tight', writer='pillow', fps=10)
+    ani.save(fig_path, dpi=150, writer='pillow', fps=10)
     plt.close(fig)
+    del ani
     
     print(f"  Saved top-k visualization to {fig_path}")
     
@@ -1164,25 +1402,27 @@ def analyze_and_document(
               f"{img_info['max_location']}, Label={img_info['label']}")
         
         # Reconstruct spatial map
-        H, W = 14, 14 # Adjust based on your architecture
-        spatial_map = np.zeros((H, W))
+        T, H, W = 8, 14, 14 # Adjust based on your architecture
+        spatiotemporal_map = np.zeros((T, H, W))
         
         # for spatial_data in img_info['all_spatial_data']:
         #     h, w = spatial_data['spatial_h'], spatial_data['spatial_w']
         for spatial_data in img_info['all_spatial_activations']:
-            h, w = spatial_data['spatial_h'], spatial_data['spatial_w']
+            t, h, w = spatial_data['time_step'], spatial_data['spatial_h'], spatial_data['spatial_w']
             if h is not None and w is not None:
-                spatial_map[h, w] = spatial_data['activation']
+                spatiotemporal_map[t, h, w] = spatial_data['activation']
         
         # Visualize
-        spatial_fig = create_spatial_visualization(
-            image, spatial_map, feature_idx, img_info
+        ani, spatial_fig = create_spatial_visualization(
+            image, spatiotemporal_map, feature_idx, img_info
         )
         
-        spatial_path = save_dir / f'{feature_idx:04d}_{tag}' / f'feature_{feature_idx:04d}_spatial_img{i+1}.png'
-        os.makedirs(save_dir / f'{feature_idx:04d}_{tag}', exist_ok=True)
-        spatial_fig.savefig(spatial_path, dpi=150, bbox_inches='tight')
+        spatial_path = save_dir / f'{tag}_{feature_idx:04d}' / f'feature_{feature_idx:04d}_spatial_img{i+1}.gif'
+        os.makedirs(save_dir / f'{tag}_{feature_idx:04d}', exist_ok=True)
+        # spatial_fig.save(spatial_path, writer='pillow', fps=10, dpi=150, bbox_inches='tight')
+        ani.save(spatial_path, writer='pillow', fps=10, dpi=150)
         plt.close(spatial_fig)
+        del ani
         
         spatial_visualizations.append({
             'rank': i + 1,
@@ -1231,8 +1471,8 @@ def analyze_and_document(
     
     plt.tight_layout()
     
-    dist_path = save_dir / f'{feature_idx:04d}_{tag}' / f'feature_{feature_idx:04d}_distribution.png'
-    os.makedirs(save_dir / f'{feature_idx:04d}_{tag}', exist_ok=True)
+    dist_path = save_dir / f'{tag}_{feature_idx:04d}' / f'feature_{feature_idx:04d}_distribution.png'
+    os.makedirs(save_dir / f'{tag}_{feature_idx:04d}', exist_ok=True)
     fig.savefig(dist_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     
@@ -1315,7 +1555,8 @@ def analyze_and_document(
     # print(f"  Saved report to {json_path}")
 
     report = save_feature_analysis_with_metadata(
-        feature_idx, all_activations, all_images_metadata, tag=tag
+        feature_idx, all_activations, all_images_metadata, tag=tag,
+        save_dir=save_dir
     )
     
     # ========================================================================
@@ -1332,83 +1573,3 @@ def analyze_and_document(
     print(f"{'='*70}\n")
     
     return report
-
-
-def find_top_k_activating_images(
-    sae_state,
-    feature_idx,
-    target_state,
-    target_layer,
-    dataset,
-    k=20,
-    extract_acts=False,
-):
-    """
-    Find images that maximally activate a specific feature.
-    
-    Returns both the images and their activation values.
-    """
-    all_activations = []
-    all_images = []
-    all_labels = []
-    
-    for images, labels in dataset:
-        # Get CNN activations
-        # images = images[np.newaxis, :, :, :, :]
-        if extract_acts:
-            acts, _, _ = extract_activations(target_state, target_state.params, images, target_layer)
-        else:
-            acts = images
-        
-        # Get SAE features
-        sae_features, _ = sae_state.apply_fn(sae_state.params, acts)
-        print(sae_features.shape)
-        sys.exit()
-        
-    #     # Extract this specific feature
-    #     feature_vals = sae_features[:, feature_idx]
-        
-    #     all_activations.extend(feature_vals)
-    #     all_images.extend(images)
-    #     all_labels.extend(labels)
-    
-    # # Sort by activation value
-    # sorted_indices = np.argsort(all_activations)[::-1]  # Descending
-    
-    # # Get top-k
-    # top_k_indices = sorted_indices[:k]
-    
-    # return {
-    #     'images': [all_images[i] for i in top_k_indices],
-    #     'activations': [all_activations[i] for i in top_k_indices],
-    #     'labels': [all_labels[i] for i in top_k_indices],
-    #     'indices': top_k_indices
-    # }
-
-
-# def visualize_feature(feature_idx, top_k_results, rows=4, cols=5):
-#     """Display top-k activating images in a grid."""
-#     fig, axes = plt.subplots(rows, cols, figsize=(15, 12))
-    
-#     for i, ax in enumerate(axes.flat):
-#         if i < len(top_k_results['images']):
-#             img = top_k_results['images'][i]
-#             act = top_k_results['activations'][i]
-#             label = top_k_results['labels'][i]
-            
-#             ax.imshow(img)
-#             ax.set_title(f"{label}\nAct: {act:.3f}", fontsize=10)
-#             ax.axis('off')
-#         else:
-#             ax.axis('off')
-    
-#     plt.suptitle(f"Feature {feature_idx} - Top Activating Images", 
-#                  fontsize=16, fontweight='bold')
-#     plt.tight_layout()
-#     return fig
-
-# # Usage
-# top_results = find_top_k_activating_images(
-#     sae, feature_idx=234, cnn_model=model, dataset=val_loader, k=20
-# )
-# visualize_feature(234, top_results)

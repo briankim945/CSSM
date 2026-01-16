@@ -36,7 +36,8 @@ from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
 from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit_small
 from src.data import IMAGENETTE_CLASSES, load_image_val
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info
-from xai.gradcam_utils import get_heatmap, visualize_gradcam_video, create_image_pan_seq
+from xai.gradcam_utils import get_heatmap, visualize_gradcam_video
+from xai.utils import create_image_pan_seq
 
 
 class TrainState(train_state.TrainState):
@@ -278,7 +279,7 @@ def main():
         random_file_name = random.choice(os.listdir(f"data/{args.target_class}"))
         target_path = f'data/{args.target_class}/{random_file_name}'
         print(random_file_name)
-        train_features = create_image_pan_seq(target_path)
+        # train_features = create_image_pan_seq(target_path)
 
         # train_loader, val_loader = get_imagenette_video_loader_train_val_split(
         #     data_dir=args.data_dir,
