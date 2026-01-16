@@ -35,7 +35,7 @@ from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit
 from src.models.deit3 import DeiT3Large, deit3_large_patch16_384, deit3_base_patch16_224
 from src.models.cssm_deit3 import CSSMDeiT3Large, cssm_deit3_large_patch16_384, cssm_deit3_base_patch16_224
 from src.models.cssm_shvit import CSSMSHViT
-from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenet_loader, get_imagenet_info
+from src.data import get_imagenette_video_loader, get_dataset_info #, get_imagenet_loader, get_imagenet_info
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info, get_pathfinder_tfrecord_loader
 
 
