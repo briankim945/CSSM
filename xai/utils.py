@@ -2,8 +2,81 @@ import numpy as np
 from scipy.ndimage import zoom
 from PIL import Image
 from random import randint, choice
+from typing import Tuple
+
+import jax
+import jax.numpy as jnp
+import optax
+import wandb
+from flax import linen as nn
+from flax.training import train_state
 
 from src.data import IMAGENET_MEAN, IMAGENET_STD
+
+
+class TrainState(train_state.TrainState):
+    """Extended train state with additional tracking."""
+    # batch_stats: dict
+    epoch: int = 0
+
+
+def get_init_state(
+    rng: jax.Array,
+    model: nn.Module,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-4,
+    total_steps: int = 10000,
+    warmup_steps: int = 500,
+    grad_clip: float = 1.0,
+) -> Tuple[TrainState, optax.GradientTransformation]:
+    """
+    Initialize training state with optimizer and LR schedule.
+
+    Args:
+        rng: Random key for initialization
+        model: The model to train
+        learning_rate: Peak learning rate
+        weight_decay: Weight decay coefficient
+        total_steps: Total training steps for LR schedule
+        warmup_steps: Number of warmup steps
+        grad_clip: Maximum gradient norm
+
+    Returns:
+        Tuple of (train_state, optimizer)
+    """
+    # Create dummy input for initialization
+    dummy_input = jnp.ones((1, 8, 224, 224, 3))
+    variables = model.init({'params': rng, 'dropout': rng}, dummy_input, training=False)
+    params = variables['params']
+
+    # Learning rate schedule: warmup + cosine decay
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=learning_rate,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps - warmup_steps,
+        end_value=learning_rate * 0.01,
+    )
+
+    # Optimizer: AdamW with gradient clipping
+    tx = optax.chain(
+        optax.clip_by_global_norm(grad_clip),
+        optax.adamw(learning_rate=schedule, weight_decay=weight_decay),
+    )
+
+    # Wrap with apply_if_finite to skip updates on NaN/Inf gradients
+    # This prevents NaN propagation and helps debug where instability originates
+    tx = optax.apply_if_finite(tx, max_consecutive_errors=5)
+
+    state = TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        # batch_stats=variables['batch_stats'] if 'batch_stats' in variables else {},
+        tx=tx,
+        epoch=0,
+    )
+
+    return state, tx, variables
 
 
 def create_image_pan_seq(

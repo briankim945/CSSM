@@ -252,6 +252,7 @@ def main():
         target=state
         # abstract_my_tree
     )
+    sys.exit()
 
     lr = 1e-5
 
