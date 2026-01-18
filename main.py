@@ -35,12 +35,14 @@ from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit
 from src.models.deit3 import DeiT3Large, deit3_large_patch16_384, deit3_base_patch16_224
 from src.models.cssm_deit3 import CSSMDeiT3Large, cssm_deit3_large_patch16_384, cssm_deit3_base_patch16_224
 from src.models.cssm_shvit import CSSMSHViT
+from src.models.shvit import SHViT
 from src.data import get_imagenette_video_loader, get_dataset_info #, get_imagenet_loader, get_imagenet_info
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info, get_pathfinder_tfrecord_loader
 
 
 class TrainState(train_state.TrainState):
     """Extended train state with additional tracking."""
+    batch_stats: dict
     epoch: int = 0
 
 
@@ -95,6 +97,7 @@ def create_train_state(
     state = TrainState.create(
         apply_fn=model.apply,
         params=params,
+        batch_stats=variables['batch_stats'] if 'batch_stats' in variables else {},
         tx=tx,
         epoch=0,
     )
@@ -124,21 +127,24 @@ def train_step(
     videos, labels = batch
 
     def loss_fn(params):
-        logits = state.apply_fn(
+        logits, updates = state.apply_fn(
             {'params': params},
             videos,
             training=True,
             rngs={'dropout': rng},
+            mutable=['batch_stats'],
         )
         one_hot = jax.nn.one_hot(labels, num_classes)
         loss = optax.softmax_cross_entropy(logits, one_hot).mean()
-        return loss, logits
+        return loss, (logits, updates)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
+    (loss, (logits, updates)), grads = grad_fn(state.params)
 
     # Update state
     state = state.apply_gradients(grads=grads)
+    if 'batch_stats' in updates:
+        state = state.replace(batch_stats=updates['batch_stats'])
 
     # Compute metrics
     acc = jnp.mean(jnp.argmax(logits, -1) == labels)
@@ -170,8 +176,10 @@ def eval_step(
     """
     videos, labels = batch
 
+    variables = {'params': state.params, 'batch_stats': state.batch_stats}
+
     logits = state.apply_fn(
-        {'params': state.params},
+        variables,
         videos,
         training=False,
     )
@@ -228,7 +236,7 @@ def main():
 
     # Architecture selection
     parser.add_argument('--arch', type=str,
-                        choices=['convnext', 'vit', 'baseline', 'deit3', 'cssm_deit3', 'cssm_shvit'],
+                        choices=['convnext', 'vit', 'baseline', 'deit3', 'cssm_deit3', 'cssm_shvit', 'shvit'],
                         default='convnext',
                         help='Architecture: convnext, vit (CSSM-ViT), baseline (ViT), deit3, cssm_deit3')
 
@@ -351,8 +359,10 @@ def main():
         elif args.arch == 'baseline':
             temporal_str = f"_temp{args.temporal_attn_every}" if not args.no_temporal_attn else "_notime"
             run_name = f"baseline_d{args.depth}_e{args.embed_dim}_h{args.num_heads}{temporal_str}"
-        if args.arch == 'cssm_shvit':
+        elif args.arch == 'cssm_shvit':
             run_name = f"cssm_shvit_{args.cssm}_e{args.embed_dim}"
+        elif args.arch == 'shvit':
+            run_name = f"shvit"#f"shvit_{args.cssm}_e{args.embed_dim}"
         else:
             run_name = f"{args.mode}_{args.cssm}_{args.mixing}"
 
@@ -381,7 +391,7 @@ def main():
         # Set default data dir for pathfinder if not specified
         if 'imagenette' in args.data_dir:
             args.data_dir = '/media/data_cifs_lrs/projects/prj_LRA/PathFinder/pathfinder300_new_2025'
-        dataset_info = get_pathfinder_info(args.pathfinder_difficulty)
+        dataset_info = get_pathfinder_info(args.pathfinder_difficulty, root=args.data_dir)
         dataset_name = f"Pathfinder (difficulty={args.pathfinder_difficulty})"
     elif args.dataset == 'imagenet':
         dataset_info = get_imagenet_info()
@@ -467,6 +477,19 @@ def main():
             rope_mode=args.rope_mode,
             use_dwconv=args.use_dwconv,
             output_act=args.output_act,
+        )
+    elif args.arch == 'shvit':
+        model = SHViT(
+            num_classes=num_classes,
+            # embed_dim=args.embed_dim,
+            # cssm_type=args.cssm,
+            # dense_mixing=(args.mixing == 'dense'),
+            # block_size=args.block_size,
+            # gate_activation=args.gate_activation,
+            # num_timesteps=args.seq_len,
+            # rope_mode=args.rope_mode,
+            # use_dwconv=args.use_dwconv,
+            # output_act=args.output_act,
         )
     else:
         model = ModelFactory(

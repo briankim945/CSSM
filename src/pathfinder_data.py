@@ -61,7 +61,8 @@ class PathfinderDataset:
         self.image_paths = []
         self.labels = []
 
-        imgs_dir = self.root / 'imgs'
+        # imgs_dir = self.root / 'imgs'
+        imgs_dir = self.root
 
         # Negative examples (label=0)
         neg_dir = imgs_dir / 'neg'
@@ -117,8 +118,8 @@ def get_pathfinder_datasets(
     difficulty: str = '9',
     image_size: int = 224,
     num_frames: int = 1,
-    train_ratio: float = 0.8,
-    val_ratio: float = 0.1,
+    train_ratio: float = 0.85,
+    val_ratio: float = 0.15,
     seed: int = 42,
 ) -> Tuple['PathfinderDataset', 'PathfinderDataset', 'PathfinderDataset']:
     """
@@ -136,36 +137,53 @@ def get_pathfinder_datasets(
     Returns:
         Tuple of (train_dataset, val_dataset, test_dataset)
     """
-    difficulty_dir = os.path.join(root, f'curv_contour_length_{difficulty}')
+    difficulty_dir = os.path.join(root, f'curv_contour_length_{difficulty}', 'imgs')
 
     if not os.path.exists(difficulty_dir):
         raise ValueError(f"Difficulty folder not found: {difficulty_dir}")
+    
+    train_dir = os.path.join(difficulty_dir, 'train')
 
-    # Create full dataset
-    full_dataset = PathfinderDataset(
-        root=difficulty_dir,
+    if not os.path.exists(train_dir):
+        raise ValueError(f"Train folder not found: {train_dir}")
+    
+    test_dir = os.path.join(difficulty_dir, 'test')
+
+    if not os.path.exists(test_dir):
+        raise ValueError(f"Test folder not found: {test_dir}")
+
+    # Create train/val dataset
+    train_val_dataset = PathfinderDataset(
+        root=train_dir,
+        image_size=image_size,
+        num_frames=num_frames,
+    )
+
+    # Create test dataset
+    test_dataset = PathfinderDataset(
+        root=test_dir,
         image_size=image_size,
         num_frames=num_frames,
     )
 
     # Split indices
-    n_total = len(full_dataset)
+    n_total = len(train_val_dataset)
     indices = np.arange(n_total)
 
     rng = np.random.RandomState(seed)
     rng.shuffle(indices)
 
     n_train = int(n_total * train_ratio)
-    n_val = int(n_total * val_ratio)
+    # n_val = int(n_total * val_ratio)
 
     train_indices = indices[:n_train]
-    val_indices = indices[n_train:n_train + n_val]
-    test_indices = indices[n_train + n_val:]
+    val_indices = indices[n_train:]
+    # test_indices = indices[n_train + n_val:]
 
     # Create subset datasets
-    train_dataset = PathfinderSubset(full_dataset, train_indices)
-    val_dataset = PathfinderSubset(full_dataset, val_indices)
-    test_dataset = PathfinderSubset(full_dataset, test_indices)
+    train_dataset = PathfinderSubset(train_val_dataset, train_indices)
+    val_dataset = PathfinderSubset(train_val_dataset, val_indices)
+    # test_dataset = PathfinderSubset(full_dataset, test_indices)
 
     return train_dataset, val_dataset, test_dataset
 
@@ -406,10 +424,17 @@ def get_pathfinder_info(
     """Get dataset metadata."""
     # Count actual images
     difficulty_dir = os.path.join(root, f'curv_contour_length_{difficulty}', 'imgs')
-    n_pos = len(list(Path(difficulty_dir).glob('pos/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'pos')) else 0
-    n_neg = len(list(Path(difficulty_dir).glob('neg/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'neg')) else 0
-    total = n_pos + n_neg
-    train_size = int(total * train_ratio)
+    # n_pos = len(list(Path(difficulty_dir).glob('pos/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'pos')) else 0
+    # n_neg = len(list(Path(difficulty_dir).glob('neg/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'neg')) else 0
+    # total = n_pos + n_neg
+    # train_size = int(total * train_ratio)
+
+    train_n_pos = len(list(Path(difficulty_dir).glob('train/pos/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'train', 'pos')) else 0
+    train_n_neg = len(list(Path(difficulty_dir).glob('train/neg/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'train', 'neg')) else 0
+    test_n_pos = len(list(Path(difficulty_dir).glob('test/pos/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'test', 'pos')) else 0
+    test_n_neg = len(list(Path(difficulty_dir).glob('test/neg/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'test', 'neg')) else 0
+    train_size = train_n_pos + train_n_neg
+    total = train_size + test_n_pos + test_n_neg
 
     return {
         'num_classes': 2,
