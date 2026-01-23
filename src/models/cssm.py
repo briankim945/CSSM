@@ -2128,6 +2128,8 @@ class HGRUBilinearCSSM(nn.Module):
     rope_mode: str = 'none'
     rope_base: float = 10000.0
     concat_xyz: bool = True
+    readout_state: str = 'xyz'  # Which state(s) to use: 'xyz', 'x', 'y', 'z', 'xy', 'xz', 'yz'
+    pre_output_act: str = 'none'  # Activation before output_proj: 'gelu', 'silu', or 'none'
     # API compatibility
     gate_rank: int = 0
     dense_mixing: bool = False
@@ -2140,6 +2142,15 @@ class HGRUBilinearCSSM(nn.Module):
             return nn.softplus(x)
         else:
             return nn.sigmoid(x)
+
+    def _apply_pre_output_act(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply activation before output_proj if configured."""
+        if self.pre_output_act == 'gelu':
+            return jax.nn.gelu(x)
+        elif self.pre_output_act == 'silu':
+            return jax.nn.silu(x)
+        else:
+            return x
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -2318,22 +2329,40 @@ class HGRUBilinearCSSM(nn.Module):
         # =====================================================================
         # 7. CONVERT BACK AND APPLY OUTPUT GATE
         # =====================================================================
-        if self.concat_xyz:
-            XYZ_hat = from_goom(State_log)  # (B, T, C, H, W_freq, 3)
-            XYZ_hat_gated = XYZ_hat * C_gate[..., None]
+        XYZ_hat = from_goom(State_log)  # (B, T, C, H, W_freq, 3)
+        XYZ_hat_gated = XYZ_hat * C_gate[..., None]
 
-            # Reshape for IFFT
+        # Select which states to use based on readout_state
+        state_indices = {'x': [0], 'y': [1], 'z': [2],
+                         'xy': [0, 1], 'xz': [0, 2], 'yz': [1, 2],
+                         'xyz': [0, 1, 2]}
+        indices = state_indices.get(self.readout_state, [0, 1, 2])
+
+        if len(indices) == 3 and self.concat_xyz:
+            # Original behavior: concatenate all and project
             XYZ_hat_gated = XYZ_hat_gated.transpose(0, 1, 2, 5, 3, 4)
             XYZ_hat_gated = XYZ_hat_gated.reshape(B, T, C * 3, H, -1)
 
             xyz_out = jnp.fft.irfft2(XYZ_hat_gated, s=(H, W), axes=(3, 4))
             xyz_out = xyz_out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, 3C)
+            xyz_out = self._apply_pre_output_act(xyz_out)
             return nn.Dense(C, name='output_proj')(xyz_out)
+        elif len(indices) == 1:
+            # Single state output (x, y, or z) - no projection needed
+            idx = indices[0]
+            state_hat = XYZ_hat_gated[..., idx]
+            state_out = jnp.fft.irfft2(state_hat, s=(H, W), axes=(3, 4))
+            state_out = state_out.transpose(0, 1, 3, 4, 2)
+            return self._apply_pre_output_act(state_out)
         else:
-            # Use X channel only
-            X_log = State_log[..., 0]
-            X_hat = from_goom(X_log)
-            X_hat_gated = X_hat * C_gate
+            # Multiple states: concatenate selected and project
+            selected = [XYZ_hat_gated[..., i] for i in indices]
+            # Stack and reshape for IFFT
+            stacked = jnp.stack(selected, axis=-1)  # (B, T, C, H, W_freq, len(indices))
+            stacked = stacked.transpose(0, 1, 2, 5, 3, 4)
+            stacked = stacked.reshape(B, T, C * len(indices), H, -1)
 
-            x_out = jnp.fft.irfft2(X_hat_gated, s=(H, W), axes=(3, 4))
-            return x_out.transpose(0, 1, 3, 4, 2)
+            out = jnp.fft.irfft2(stacked, s=(H, W), axes=(3, 4))
+            out = out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, len*C)
+            out = self._apply_pre_output_act(out)
+            return nn.Dense(C, name='output_proj')(out)

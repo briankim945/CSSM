@@ -15,6 +15,7 @@ Training features:
 
 import argparse
 import os
+import pickle
 import re
 import time
 from functools import partial
@@ -22,12 +23,107 @@ from typing import Any, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import wandb
 from flax import linen as nn
+from flax import jax_utils
 from flax.training import train_state
 from tqdm import tqdm
-import orbax.checkpoint as ocp
+
+# =============================================================================
+# Performance optimizations
+# =============================================================================
+def setup_jax_optimizations(use_cache: bool = True, use_bf16: bool = False):
+    """Configure JAX for optimal performance."""
+    # Enable persistent compilation cache (huge speedup on restarts)
+    if use_cache:
+        cache_dir = os.path.expanduser('~/.cache/jax_compilation_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        jax.config.update('jax_compilation_cache_dir', cache_dir)
+
+    # Enable bfloat16 matrix multiplication (faster on modern GPUs)
+    if use_bf16:
+        jax.config.update('jax_default_matmul_precision', 'bfloat16')
+
+    # Disable debug nans check in production (small speedup)
+    jax.config.update('jax_debug_nans', False)
+
+
+# =============================================================================
+# Simple pickle-based checkpointer (NFS-safe, no TensorStore dependency)
+# =============================================================================
+class SimpleCheckpointer:
+    """
+    Simple pickle-based checkpointer that works reliably on NFS.
+
+    Orbax/TensorStore use atomic renames which fail on many NFS setups.
+    This saves only params/batch_stats/epoch (not optimizer state which has
+    unpicklable closures from optax.apply_if_finite).
+    """
+
+    def save(self, path: str, state: Any) -> None:
+        """Save state to pickle file (only picklable parts)."""
+        os.makedirs(path, exist_ok=True)
+
+        # Convert JAX arrays to numpy for pickling
+        def to_numpy(x):
+            if hasattr(x, 'numpy'):
+                return np.array(x)
+            elif isinstance(x, jnp.ndarray):
+                return np.array(x)
+            return x
+
+        # Only save the parts we need (params, batch_stats, epoch, step)
+        # Skip opt_state and apply_fn which have unpicklable closures
+        checkpoint_data = {
+            'params': jax.tree_util.tree_map(to_numpy, state.params),
+            'epoch': int(state.epoch) if hasattr(state.epoch, 'item') else state.epoch,
+            'step': int(state.step) if hasattr(state.step, 'item') else state.step,
+        }
+        if hasattr(state, 'batch_stats') and state.batch_stats is not None:
+            checkpoint_data['batch_stats'] = jax.tree_util.tree_map(to_numpy, state.batch_stats)
+
+        # Save to temp file first, then rename (more atomic)
+        tmp_path = os.path.join(path, 'checkpoint.pkl.tmp')
+        final_path = os.path.join(path, 'checkpoint.pkl')
+
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(checkpoint_data, f)
+
+        # Rename (if this fails on NFS, just copy)
+        try:
+            os.rename(tmp_path, final_path)
+        except OSError:
+            import shutil
+            shutil.copy2(tmp_path, final_path)
+            os.remove(tmp_path)
+
+    def restore(self, path: str, state: Any) -> Any:
+        """Restore state from pickle file."""
+        ckpt_file = os.path.join(path, 'checkpoint.pkl')
+
+        with open(ckpt_file, 'rb') as f:
+            checkpoint_data = pickle.load(f)
+
+        # Convert numpy arrays back to JAX arrays
+        def to_jax(x):
+            if isinstance(x, np.ndarray):
+                return jnp.array(x)
+            return x
+
+        # Restore into the existing state structure (keeps opt_state, apply_fn)
+        restored_params = jax.tree_util.tree_map(to_jax, checkpoint_data['params'])
+        restored_epoch = jnp.array(checkpoint_data.get('epoch', 0))
+
+        # Update state with restored values
+        state = state.replace(params=restored_params, epoch=restored_epoch)
+
+        if 'batch_stats' in checkpoint_data and checkpoint_data['batch_stats'] is not None:
+            restored_batch_stats = jax.tree_util.tree_map(to_jax, checkpoint_data['batch_stats'])
+            state = state.replace(batch_stats=restored_batch_stats)
+
+        return state
 
 from src.models.convnext import ModelFactory
 from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
@@ -36,11 +132,47 @@ from src.models.deit3 import DeiT3Large, deit3_large_patch16_384, deit3_base_pat
 from src.models.cssm_deit3 import CSSMDeiT3Large, cssm_deit3_large_patch16_384, cssm_deit3_base_patch16_224
 from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenet_loader, get_imagenet_info
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info, get_pathfinder_tfrecord_loader
+from src.cabc_data import get_cabc_loader, get_cabc_info, get_cabc_tfrecord_loader
+
+
+# Multi-GPU utilities
+def get_device_setup():
+    """Get device information for multi-GPU training."""
+    devices = jax.devices()
+    num_devices = len(devices)
+    return devices, num_devices, num_devices > 1
+
+
+def pmean_complex_safe(x, axis_name='devices'):
+    """
+    pmean that handles complex-valued arrays by converting to real representation.
+
+    NCCL doesn't support complex types directly. We stack real and imaginary
+    parts into a single float array, do pmean, then unstack.
+    """
+    def _pmean_leaf(leaf):
+        # Use explicit dtype comparison instead of issubdtype for traced context
+        is_complex = (leaf.dtype == jnp.complex64 or leaf.dtype == jnp.complex128)
+        if is_complex:
+            # Stack real and imag into last dimension: (..., 2)
+            stacked = jnp.stack([jnp.real(leaf), jnp.imag(leaf)], axis=-1)
+            stacked = stacked.astype(jnp.float32)
+            # Single pmean on the float array
+            stacked_mean = jax.lax.pmean(stacked, axis_name=axis_name)
+            # Unstack and recombine to complex
+            real_mean = stacked_mean[..., 0]
+            imag_mean = stacked_mean[..., 1]
+            return (real_mean + 1j * imag_mean).astype(leaf.dtype)
+        else:
+            return jax.lax.pmean(leaf, axis_name=axis_name)
+
+    return jax.tree_util.tree_map(_pmean_leaf, x)
 
 
 class TrainState(train_state.TrainState):
     """Extended train state with additional tracking."""
-    epoch: int = 0
+    epoch: jnp.ndarray = None  # Use array for multi-GPU compatibility
+    batch_stats: Any = None  # For BatchNorm running statistics
 
 
 def create_train_state(
@@ -71,6 +203,7 @@ def create_train_state(
     dummy_input = jnp.ones((1, 8, 224, 224, 3))
     variables = model.init({'params': rng, 'dropout': rng}, dummy_input, training=False)
     params = variables['params']
+    batch_stats = variables.get('batch_stats', None)  # For BatchNorm
 
     # Learning rate schedule: warmup + cosine decay
     schedule = optax.warmup_cosine_decay_schedule(
@@ -95,18 +228,20 @@ def create_train_state(
         apply_fn=model.apply,
         params=params,
         tx=tx,
-        epoch=0,
+        epoch=jnp.array(0),  # Use JAX array for multi-GPU compatibility
+        batch_stats=batch_stats,
     )
 
     return state, tx
 
 
-@partial(jax.jit, static_argnums=(3,))
+@partial(jax.jit, static_argnums=(3, 4))
 def train_step(
     state: TrainState,
     batch: Tuple[jnp.ndarray, jnp.ndarray],
     rng: jax.Array,
     num_classes: int,
+    has_batch_stats: bool = False,
 ) -> Tuple[TrainState, Dict[str, float]]:
     """
     Single training step.
@@ -116,28 +251,48 @@ def train_step(
         batch: Tuple of (videos, labels)
         rng: Random key for dropout
         num_classes: Number of output classes
+        has_batch_stats: Whether model uses BatchNorm
 
     Returns:
         Tuple of (updated_state, metrics_dict)
+
+    Note: donate_argnums=(0,) allows JAX to reuse the state's memory buffer,
+    reducing memory allocation overhead.
     """
     videos, labels = batch
 
-    def loss_fn(params):
-        logits = state.apply_fn(
-            {'params': params},
-            videos,
-            training=True,
-            rngs={'dropout': rng},
-        )
-        one_hot = jax.nn.one_hot(labels, num_classes)
-        loss = optax.softmax_cross_entropy(logits, one_hot).mean()
-        return loss, logits
+    def loss_fn(params, batch_stats):
+        variables = {'params': params}
+        if has_batch_stats:
+            variables['batch_stats'] = batch_stats
+            output, mutated = state.apply_fn(
+                variables,
+                videos,
+                training=True,
+                rngs={'dropout': rng},
+                mutable=['batch_stats'],
+            )
+            return optax.softmax_cross_entropy(
+                output, jax.nn.one_hot(labels, num_classes)
+            ).mean(), (output, mutated['batch_stats'])
+        else:
+            logits = state.apply_fn(
+                variables,
+                videos,
+                training=True,
+                rngs={'dropout': rng},
+            )
+            return optax.softmax_cross_entropy(
+                logits, jax.nn.one_hot(labels, num_classes)
+            ).mean(), (logits, None)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
+    (loss, (logits, new_batch_stats)), grads = grad_fn(state.params, state.batch_stats)
 
     # Update state
     state = state.apply_gradients(grads=grads)
+    if has_batch_stats and new_batch_stats is not None:
+        state = state.replace(batch_stats=new_batch_stats)
 
     # Compute metrics
     acc = jnp.mean(jnp.argmax(logits, -1) == labels)
@@ -150,11 +305,12 @@ def train_step(
     return state, metrics
 
 
-@partial(jax.jit, static_argnums=(2,))
+@partial(jax.jit, static_argnums=(2, 3))
 def eval_step(
     state: TrainState,
     batch: Tuple[jnp.ndarray, jnp.ndarray],
     num_classes: int,
+    has_batch_stats: bool = False,
 ) -> Dict[str, float]:
     """
     Single evaluation step.
@@ -163,14 +319,19 @@ def eval_step(
         state: Current training state
         batch: Tuple of (videos, labels)
         num_classes: Number of output classes
+        has_batch_stats: Whether model uses BatchNorm
 
     Returns:
         Dictionary of metrics
     """
     videos, labels = batch
 
+    variables = {'params': state.params}
+    if has_batch_stats:
+        variables['batch_stats'] = state.batch_stats
+
     logits = state.apply_fn(
-        {'params': state.params},
+        variables,
         videos,
         training=False,
     )
@@ -190,6 +351,7 @@ def evaluate(
     val_loader,
     num_classes: int,
     num_batches: int = None,
+    has_batch_stats: bool = False,
 ) -> Dict[str, float]:
     """
     Run full validation evaluation.
@@ -199,6 +361,7 @@ def evaluate(
         val_loader: Validation data iterator
         num_classes: Number of output classes
         num_batches: Max batches to evaluate (None = all)
+        has_batch_stats: Whether model uses BatchNorm
 
     Returns:
         Dictionary of averaged metrics
@@ -211,9 +374,143 @@ def evaluate(
         if num_batches is not None and i >= num_batches:
             break
 
-        metrics = eval_step(state, batch, num_classes)
+        metrics = eval_step(state, batch, num_classes, has_batch_stats)
         total_loss += float(metrics['val_loss'])
         total_acc += float(metrics['val_acc'])
+        count += 1
+
+    return {
+        'val_loss': total_loss / max(count, 1),
+        'val_acc': total_acc / max(count, 1),
+    }
+
+
+# Multi-GPU versions using pmap
+# Pattern matched to working ImageNet training in src/training/distributed.py
+def create_pmap_train_step(num_classes: int, has_batch_stats: bool = False):
+    """Create pmap'd train step for multi-GPU training."""
+
+    def train_step_pmap(state, batch, rng):
+        videos, labels = batch
+
+        def loss_fn(params, batch_stats):
+            variables = {'params': params}
+            if has_batch_stats:
+                variables['batch_stats'] = batch_stats
+                output, mutated = state.apply_fn(
+                    variables,
+                    videos,
+                    training=True,
+                    rngs={'dropout': rng},
+                    mutable=['batch_stats'],
+                )
+                return optax.softmax_cross_entropy(
+                    output, jax.nn.one_hot(labels, num_classes)
+                ).mean(), (output, mutated['batch_stats'])
+            else:
+                logits = state.apply_fn(
+                    variables,
+                    videos,
+                    training=True,
+                    rngs={'dropout': rng},
+                )
+                return optax.softmax_cross_entropy(
+                    logits, jax.nn.one_hot(labels, num_classes)
+                ).mean(), (logits, None)
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (logits, new_batch_stats)), grads = grad_fn(state.params, state.batch_stats)
+
+        # Average gradients across devices (plain pmean - matches ImageNet training)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        loss = jax.lax.pmean(loss, axis_name='batch')
+
+        # Update state
+        state = state.apply_gradients(grads=grads)
+        if has_batch_stats and new_batch_stats is not None:
+            # Average batch stats across devices
+            new_batch_stats = jax.lax.pmean(new_batch_stats, axis_name='batch')
+            state = state.replace(batch_stats=new_batch_stats)
+
+        # Compute metrics
+        acc = jnp.mean(jnp.argmax(logits, -1) == labels)
+        acc = jax.lax.pmean(acc, axis_name='batch')
+
+        metrics = {
+            'train_loss': loss,
+            'train_acc': acc,
+        }
+
+        return state, metrics
+
+    # Match ImageNet training: use 'batch' axis_name and donate_argnums
+    return jax.pmap(train_step_pmap, axis_name='batch', donate_argnums=(0,))
+
+
+def create_pmap_eval_step(num_classes: int, has_batch_stats: bool = False):
+    """Create pmap'd eval step for multi-GPU evaluation."""
+
+    def eval_step_pmap(state, batch):
+        videos, labels = batch
+
+        variables = {'params': state.params}
+        if has_batch_stats:
+            variables['batch_stats'] = state.batch_stats
+
+        logits = state.apply_fn(
+            variables,
+            videos,
+            training=False,
+        )
+
+        one_hot = jax.nn.one_hot(labels, num_classes)
+        loss = optax.softmax_cross_entropy(logits, one_hot).mean()
+        acc = jnp.mean(jnp.argmax(logits, -1) == labels)
+
+        # Average across devices
+        loss = jax.lax.pmean(loss, axis_name='batch')
+        acc = jax.lax.pmean(acc, axis_name='batch')
+
+        return {
+            'val_loss': loss,
+            'val_acc': acc,
+        }
+
+    return jax.pmap(eval_step_pmap, axis_name='batch')
+
+
+def evaluate_multi_gpu(
+    state: TrainState,
+    val_loader,
+    eval_step_fn,
+    num_devices: int,
+    num_batches: int = None,
+) -> Dict[str, float]:
+    """Run multi-GPU validation evaluation."""
+    total_loss = 0.0
+    total_acc = 0.0
+    count = 0
+
+    for i, batch in enumerate(val_loader):
+        if num_batches is not None and i >= num_batches:
+            break
+
+        videos, labels = batch
+
+        # Skip incomplete batches
+        if videos.shape[0] % num_devices != 0:
+            continue
+
+        # Reshape for pmap: (B, ...) -> (num_devices, B//num_devices, ...)
+        batch_per_device = videos.shape[0] // num_devices
+        videos = videos.reshape(num_devices, batch_per_device, *videos.shape[1:])
+        labels = labels.reshape(num_devices, batch_per_device, *labels.shape[1:])
+
+        metrics = eval_step_fn(state, (videos, labels))
+
+        # Get scalar from first device (all devices have same value after pmean)
+        total_loss += float(metrics['val_loss'][0])
+        total_acc += float(metrics['val_acc'][0])
         count += 1
 
     return {
@@ -252,8 +549,18 @@ def main():
     parser.add_argument('--patch_size', type=int, default=16,
                         help='[vit/baseline] Patch size (only used with --stem_mode patch)')
     parser.add_argument('--stem_mode', type=str, default='conv',
-                        choices=['patch', 'conv', 'resnet'],
-                        help='[vit] Stem: patch (ViT-style), conv (SHViT overlapping), resnet (7x7+pool)')
+                        choices=['patch', 'conv'],
+                        help='[vit] Stem: patch (ViT-style) or conv (single conv + GELU + norm)')
+    parser.add_argument('--stem_stride', type=int, default=4,
+                        choices=[1, 2, 3, 4],
+                        help='[vit] Stem downsampling stride (only for single-conv stem)')
+    parser.add_argument('--stem_norm', type=str, default='layer',
+                        choices=['layer', 'batch'],
+                        help='[vit] Stem normalization: layer (LayerNorm) or batch (BatchNorm)')
+    parser.add_argument('--legacy_stem', action='store_true',
+                        help='[vit] Use multi-layer stem (multiple convs with intermediate nonlinearity)')
+    parser.add_argument('--stem_strides', type=str, default='2,2',
+                        help='[vit] Comma-separated strides per stem layer (e.g., "2,2" or "4" or "2,2,2"). Only with --legacy_stem')
     parser.add_argument('--no_pos_embed', action='store_true',
                         help='[vit/baseline] Disable position embeddings')
     parser.add_argument('--num_heads', type=int, default=6,
@@ -267,8 +574,8 @@ def main():
                         help='[vit] RoPE position encoding mode')
     parser.add_argument('--block_size', type=int, default=1,
                         help='[vit] Block size for LMME channel mixing (1=depthwise, >1=channel mixing). Works with gated and opponent.')
-    parser.add_argument('--kernel_size', type=int, default=15,
-                        help='[vit] Spatial kernel size for CSSM excitation/inhibition kernels')
+    parser.add_argument('--kernel_size', type=int, default=11,
+                        help='[vit] Spatial kernel size for CSSM excitation/inhibition kernels (11=original, 15=larger RF)')
     parser.add_argument('--use_dwconv', action='store_true',
                         help='[vit] Use DWConv in MLP (adds params, matches SHViT)')
     parser.add_argument('--output_act', type=str, default='none',
@@ -278,6 +585,22 @@ def main():
                         help='[vit] Layer scale initialization (1e-6 for stable deep training, 1.0 for shallow)')
     parser.add_argument('--gate_rank', type=int, default=0,
                         help='[vit] Low-rank gate bottleneck (0=full rank, try 16-64 to reduce gate params)')
+    parser.add_argument('--readout_state', type=str, default='xyz',
+                        choices=['xyz', 'x', 'y', 'z', 'xy', 'xz', 'yz'],
+                        help='[hgru_bi] Which state(s) to use for output: x=excitatory, y=inhibitory, z=interaction')
+    parser.add_argument('--pre_output_act', type=str, default='none',
+                        choices=['none', 'gelu', 'silu'],
+                        help='[hgru_bi] Activation before output_proj inside CSSM')
+    parser.add_argument('--pooling_mode', type=str, default='mean',
+                        choices=['mean', 'max', 'logsumexp'],
+                        help='[vit] Global spatial pooling mode')
+    parser.add_argument('--readout_act', type=str, default='gelu',
+                        choices=['none', 'gelu', 'silu'],
+                        help='[vit] Final activation before readout (after all blocks, before norm+pool)')
+    parser.add_argument('--legacy_readout', action='store_true',
+                        help='[vit] Use legacy readout: LayerNorm → GELU → Dense(embed_dim) → pool → Dense(num_classes)')
+    parser.add_argument('--legacy', action='store_true',
+                        help='[vit] Shortcut for --legacy_stem --stem_strides 2,2 --legacy_readout --pooling_mode logsumexp')
 
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=8,
@@ -297,6 +620,14 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='Gradient clipping norm')
 
+    # Performance optimizations
+    parser.add_argument('--bf16', action='store_true',
+                        help='Use bfloat16 matmul precision (faster on A100/H100)')
+    parser.add_argument('--no_jit_cache', action='store_true',
+                        help='Disable JAX compilation cache')
+    parser.add_argument('--xla_flags', type=str, default=None,
+                        help='Extra XLA flags (e.g., "--xla_gpu_triton_gemm_any=true")')
+
     # Logging and checkpointing
     parser.add_argument('--run_name', type=str, default=None,
                         help='Run name for checkpoints and wandb (default: auto-generated from config)')
@@ -310,10 +641,15 @@ def main():
                         help='Evaluate every N epochs')
     parser.add_argument('--save_every', type=int, default=5,
                         help='Save checkpoint every N epochs')
+    parser.add_argument('--save_best_only', action='store_true', default=False,
+                        help='Only save checkpoint with best val loss (deletes previous best)')
+    parser.add_argument('--checkpointer', type=str, default='simple',
+                        choices=['simple', 'pytree', 'standard'],
+                        help='Checkpointer: simple (pickle, NFS-safe), pytree (orbax), standard (orbax async)')
 
     # Data
-    parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder', 'imagenet'], default='imagenette',
-                        help='Dataset: imagenette, pathfinder, or imagenet')
+    parser.add_argument('--dataset', type=str, choices=['imagenette', 'pathfinder', 'cabc', 'imagenet'], default='imagenette',
+                        help='Dataset: imagenette, pathfinder, cabc, or imagenet')
     parser.add_argument('--data_dir', type=str,
                         default='/media/data_cifs/projects/prj_video_imagenet/fftconv/data/imagenette2-320',
                         help='Path to dataset directory')
@@ -322,6 +658,8 @@ def main():
                         help='Path to ImageNet directory')
     parser.add_argument('--pathfinder_difficulty', type=str, choices=['9', '14', '20'], default='9',
                         help='[pathfinder] Contour length difficulty (9=easy, 20=hard)')
+    parser.add_argument('--cabc_difficulty', type=str, choices=['easy', 'medium', 'hard'], default='easy',
+                        help='[cabc] Difficulty level (easy, medium, hard)')
     parser.add_argument('--tfrecord_dir', type=str, default=None,
                         help='[pathfinder] TFRecord directory (if set, uses TFRecord loader for max I/O perf)')
     parser.add_argument('--image_size', type=int, default=224,
@@ -341,6 +679,17 @@ def main():
 
     args = parser.parse_args()
 
+    # Setup JAX optimizations (must be before any JAX operations)
+    setup_jax_optimizations(
+        use_cache=not args.no_jit_cache,
+        use_bf16=args.bf16,
+    )
+    if args.xla_flags:
+        os.environ['XLA_FLAGS'] = args.xla_flags
+
+    # Parse stem_strides from comma-separated string to tuple of ints
+    stem_strides = tuple(int(s.strip()) for s in args.stem_strides.split(','))
+
     # Generate run name from config (or use provided name)
     if args.run_name:
         run_name = args.run_name
@@ -356,6 +705,8 @@ def main():
         # Add dataset to run name
         if args.dataset == 'pathfinder':
             run_name = f"pf{args.pathfinder_difficulty}_{run_name}"
+        elif args.dataset == 'cabc':
+            run_name = f"cabc{args.cabc_difficulty}_{run_name}"
     print(f"\n{'='*60}")
     print(f"Running Configuration: {run_name}")
     print(f"Architecture: {args.arch.upper()}")
@@ -378,8 +729,22 @@ def main():
         # Set default data dir for pathfinder if not specified
         if 'imagenette' in args.data_dir:
             args.data_dir = '/media/data_cifs_lrs/projects/prj_LRA/PathFinder/pathfinder300_new_2025'
-        dataset_info = get_pathfinder_info(args.pathfinder_difficulty)
+        dataset_info = get_pathfinder_info(
+            difficulty=args.pathfinder_difficulty,
+            root=args.data_dir,
+            tfrecord_dir=args.tfrecord_dir,
+        )
         dataset_name = f"Pathfinder (difficulty={args.pathfinder_difficulty})"
+    elif args.dataset == 'cabc':
+        # Set default data dir for cABC if not specified
+        if 'imagenette' in args.data_dir:
+            args.data_dir = '/media/data_cifs_lrs/projects/prj_LRA/cabc'
+        dataset_info = get_cabc_info(
+            difficulty=args.cabc_difficulty,
+            root=args.data_dir,
+            tfrecord_dir=args.tfrecord_dir,
+        )
+        dataset_name = f"cABC (difficulty={args.cabc_difficulty})"
     elif args.dataset == 'imagenet':
         dataset_info = get_imagenet_info()
         dataset_name = "ImageNet"
@@ -407,6 +772,8 @@ def main():
             depth=args.depth,
             patch_size=args.patch_size,
             stem_mode=args.stem_mode,
+            stem_stride=args.stem_stride,
+            stem_norm=args.stem_norm,
             cssm_type=args.cssm,
             dense_mixing=(args.mixing == 'dense'),
             concat_xy=not args.no_concat_xy,
@@ -419,6 +786,14 @@ def main():
             use_dwconv=args.use_dwconv,
             output_act=args.output_act,
             layer_scale_init=args.layer_scale_init,
+            readout_state=args.readout_state,
+            pre_output_act=args.pre_output_act,
+            pooling_mode=args.pooling_mode,
+            readout_act=args.readout_act,
+            legacy_stem=args.legacy_stem,
+            stem_strides=stem_strides,
+            legacy_readout=args.legacy_readout,
+            legacy_mode=args.legacy,
         )
     elif args.arch == 'baseline':
         model = BaselineViT(
@@ -472,7 +847,10 @@ def main():
         grad_clip=args.grad_clip,
     )
 
-    # Count parameters
+    # Check if model uses BatchNorm (has batch_stats)
+    has_batch_stats = state.batch_stats is not None
+
+    # Count parameters (before replication)
     num_params = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
     print(f"Model parameters: {num_params:,}\n")
 
@@ -480,15 +858,32 @@ def main():
         wandb.config.update({'num_params': num_params})
 
     # Setup checkpointing (must be absolute path for orbax)
-    checkpoint_dir = os.path.abspath(os.path.join(args.checkpoint_dir, run_name))
+    # Use realpath to resolve symlinks - important for NFS mounts
+    checkpoint_dir = os.path.realpath(os.path.join(args.checkpoint_dir, run_name))
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    checkpointer = ocp.StandardCheckpointer()
+    # Choose checkpointer type:
+    # - simple (default): pickle-based, works reliably on NFS
+    # - pytree: orbax PyTreeCheckpointer, faster but may fail on some NFS
+    # - standard: orbax StandardCheckpointer, fastest but often fails on NFS
+    if args.checkpointer == 'standard':
+        import orbax.checkpoint as ocp
+        checkpointer = ocp.StandardCheckpointer()
+        print("Using Orbax StandardCheckpointer (may fail on NFS)")
+    elif args.checkpointer == 'pytree':
+        import orbax.checkpoint as ocp
+        checkpointer = ocp.PyTreeCheckpointer()
+        print("Using Orbax PyTreeCheckpointer")
+    else:  # 'simple' (default)
+        checkpointer = SimpleCheckpointer()
+        print("Using SimpleCheckpointer (NFS-safe)")
 
-    # Resume from checkpoint if specified
+    # Resume from checkpoint if specified (BEFORE multi-GPU replication)
     start_epoch = 0
     global_step = 0
     best_val_acc = 0.0
+    best_val_loss = float('inf')
+    best_checkpoint_path = None
 
     if args.resume:
         resume_path = os.path.abspath(args.resume)
@@ -520,9 +915,54 @@ def main():
         else:
             print(f"WARNING: Checkpoint not found at {resume_path}, starting from scratch")
 
+    # Setup multi-GPU (AFTER checkpoint restore)
+    devices, num_devices, use_multi_gpu = get_device_setup()
+
+    # Adjust batch size for multi-GPU
+    if use_multi_gpu and args.batch_size % num_devices != 0:
+        old_bs = args.batch_size
+        args.batch_size = (args.batch_size // num_devices) * num_devices
+        print(f"Adjusted batch_size {old_bs} -> {args.batch_size} for {num_devices} devices")
+
+    batch_per_device = args.batch_size // num_devices if use_multi_gpu else args.batch_size
+
+    print(f"Devices: {num_devices} ({[str(d) for d in devices]})")
+    if use_multi_gpu:
+        print(f"Multi-GPU training enabled: batch_size={args.batch_size}, per_device={batch_per_device}")
+
+    # Create pmap'd functions for multi-GPU
+    if use_multi_gpu:
+        # Test NCCL with a simple operation first
+        print("Testing NCCL collective operations...")
+        try:
+            test_data = jnp.ones((num_devices, 10), dtype=jnp.float32)
+            simple_pmean = jax.pmap(lambda x: jax.lax.pmean(x, axis_name='batch'), axis_name='batch')
+            result = simple_pmean(test_data)
+            jax.block_until_ready(result)
+            print(f"NCCL test PASSED: pmean result shape={result.shape}, value={float(result[0, 0]):.4f}")
+        except Exception as e:
+            print(f"NCCL test FAILED: {e}")
+            print("Multi-GPU may not work. Falling back to single GPU...")
+            use_multi_gpu = False
+            devices = [devices[0]]
+            num_devices = 1
+
+        if use_multi_gpu:
+            pmap_train_step = create_pmap_train_step(num_classes, has_batch_stats)
+            pmap_eval_step = create_pmap_eval_step(num_classes, has_batch_stats)
+            # Replicate state across devices using Flax's jax_utils (matches ImageNet training)
+            state = jax_utils.replicate(state)
+            print("State replicated across devices")
+
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-        state = state.replace(epoch=epoch)
+        # Update epoch in state
+        if use_multi_gpu:
+            # For multi-GPU, epoch is already replicated in state structure
+            # Just update the unreplicated value - jax_utils handles this
+            pass  # Don't modify epoch during training - it's just for logging
+        else:
+            state = state.replace(epoch=jnp.array(epoch))
 
         # Create fresh data loaders each epoch
         if args.dataset == 'pathfinder':
@@ -541,6 +981,27 @@ def main():
                 train_loader = get_pathfinder_loader(
                     root=args.data_dir,
                     difficulty=args.pathfinder_difficulty,
+                    batch_size=args.batch_size,
+                    num_frames=args.seq_len,
+                    split='train',
+                    num_workers=args.num_workers,
+                    prefetch_batches=args.prefetch_batches,
+                )
+        elif args.dataset == 'cabc':
+            if args.tfrecord_dir:
+                train_loader = get_cabc_tfrecord_loader(
+                    tfrecord_dir=args.tfrecord_dir,
+                    difficulty=args.cabc_difficulty,
+                    batch_size=args.batch_size,
+                    num_frames=args.seq_len,
+                    split='train',
+                    shuffle=True,
+                    prefetch_batches=args.prefetch_batches,
+                )
+            else:
+                train_loader = get_cabc_loader(
+                    root=args.data_dir,
+                    difficulty=args.cabc_difficulty,
                     batch_size=args.batch_size,
                     num_frames=args.seq_len,
                     split='train',
@@ -572,24 +1033,47 @@ def main():
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", dynamic_ncols=True) as pbar:
             for batch in pbar:
                 rng, step_rng = jax.random.split(rng)
+                videos, labels = batch
+
+                # Skip incomplete batches for multi-GPU
+                if use_multi_gpu and videos.shape[0] % num_devices != 0:
+                    continue
 
                 # Time the training step
                 step_start = time.perf_counter()
-                state, metrics = train_step(state, batch, step_rng, num_classes)
+
+                if use_multi_gpu:
+                    # Reshape for pmap: (B, ...) -> (num_devices, B//num_devices, ...)
+                    videos = videos.reshape(num_devices, batch_per_device, *videos.shape[1:])
+                    labels = labels.reshape(num_devices, batch_per_device, *labels.shape[1:])
+
+                    # Split RNG for each device
+                    step_rngs = jax.random.split(step_rng, num_devices)
+
+                    state, metrics = pmap_train_step(state, (videos, labels), step_rngs)
+
+                    # Get scalar from first device (all same after pmean)
+                    loss_val = float(metrics['train_loss'][0])
+                    acc_val = float(metrics['train_acc'][0])
+                else:
+                    state, metrics = train_step(state, batch, step_rng, num_classes, has_batch_stats)
+                    loss_val = float(metrics['train_loss'])
+                    acc_val = float(metrics['train_acc'])
+
                 # Block until computation completes for accurate timing
                 jax.block_until_ready(metrics)
                 step_time = time.perf_counter() - step_start
                 epoch_step_times.append(step_time)
 
-                epoch_loss += float(metrics['train_loss'])
-                epoch_acc += float(metrics['train_acc'])
+                epoch_loss += loss_val
+                epoch_acc += acc_val
                 num_batches += 1
                 global_step += 1
 
                 # Update progress bar with timing
                 pbar.set_postfix({
-                    'loss': f"{metrics['train_loss']:.4f}",
-                    'acc': f"{metrics['train_acc']:.4f}",
+                    'loss': f"{loss_val:.4f}",
+                    'acc': f"{acc_val:.4f}",
                     'ms/step': f"{step_time*1000:.1f}",
                 })
 
@@ -598,8 +1082,8 @@ def main():
                     # Get current learning rate from optimizer state
                     lr = args.lr  # Simplified - actual LR from schedule
                     wandb.log({
-                        'train/loss': float(metrics['train_loss']),
-                        'train/acc': float(metrics['train_acc']),
+                        'train/loss': loss_val,
+                        'train/acc': acc_val,
                         'train/learning_rate': lr,
                         'train/step': global_step,
                         'timing/step_ms': step_time * 1000,
@@ -643,6 +1127,29 @@ def main():
                         num_workers=args.num_workers,
                         prefetch_batches=args.prefetch_batches,
                     )
+            elif args.dataset == 'cabc':
+                # cABC uses 'test' split for validation
+                if args.tfrecord_dir:
+                    val_loader = get_cabc_tfrecord_loader(
+                        tfrecord_dir=args.tfrecord_dir,
+                        difficulty=args.cabc_difficulty,
+                        batch_size=args.batch_size,
+                        num_frames=args.seq_len,
+                        split='test',
+                        shuffle=False,
+                        prefetch_batches=args.prefetch_batches,
+                    )
+                else:
+                    val_loader = get_cabc_loader(
+                        root=args.data_dir,
+                        difficulty=args.cabc_difficulty,
+                        batch_size=args.batch_size,
+                        num_frames=args.seq_len,
+                        split='test',
+                        shuffle=False,
+                        num_workers=args.num_workers,
+                        prefetch_batches=args.prefetch_batches,
+                    )
             elif args.dataset == 'imagenet':
                 val_loader = get_imagenet_loader(
                     data_dir=args.imagenet_dir,
@@ -658,7 +1165,10 @@ def main():
                     sequence_length=args.seq_len,
                     split='val',
                 )
-            val_metrics = evaluate(state, val_loader, num_classes)
+            if use_multi_gpu:
+                val_metrics = evaluate_multi_gpu(state, val_loader, pmap_eval_step, num_devices)
+            else:
+                val_metrics = evaluate(state, val_loader, num_classes, has_batch_stats=has_batch_stats)
 
             print(f"Epoch {epoch+1} - Val Loss: {val_metrics['val_loss']:.4f}, "
                   f"Val Acc: {val_metrics['val_acc']:.4f}")
@@ -679,14 +1189,41 @@ def main():
                 best_val_acc = val_metrics['val_acc']
                 print(f"  New best validation accuracy: {best_val_acc:.4f}")
 
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
+            # Save checkpoint based on best val loss (for pathfinder)
+            if args.save_best_only and val_metrics['val_loss'] < best_val_loss:
+                best_val_loss = val_metrics['val_loss']
+                # Delete previous best checkpoint if it exists
+                if best_checkpoint_path is not None and os.path.exists(best_checkpoint_path):
+                    import shutil
+                    shutil.rmtree(best_checkpoint_path)
+                    print(f"  Deleted previous checkpoint: {best_checkpoint_path}")
+                # Save new best checkpoint
+                best_checkpoint_path = os.path.join(checkpoint_dir, f'epoch_{epoch+1}')
+                # Unreplicate state for saving (take first device copy) and set epoch
+                if use_multi_gpu:
+                    save_state = jax.tree_util.tree_map(lambda x: x[0], state)
+                    save_state = save_state.replace(epoch=jnp.array(epoch))
+                else:
+                    save_state = state
+                checkpointer.save(best_checkpoint_path, save_state)
+                print(f"  New best val_loss: {best_val_loss:.4f} - Saved to {best_checkpoint_path}")
+
+        # Save checkpoint periodically (if not using best-only mode)
+        if not args.save_best_only and (epoch + 1) % args.save_every == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'epoch_{epoch+1}')
-            checkpointer.save(ckpt_path, state)
+            # Unreplicate state for saving (take first device copy) and set epoch
+            if use_multi_gpu:
+                save_state = jax.tree_util.tree_map(lambda x: x[0], state)
+                save_state = save_state.replace(epoch=jnp.array(epoch))
+            else:
+                save_state = state
+            checkpointer.save(ckpt_path, save_state)
             print(f"  Saved checkpoint to {ckpt_path}")
 
     # Wait for any pending checkpoint operations to complete
-    checkpointer.wait_until_finished()
+    # (only StandardCheckpointer has async operations that need waiting)
+    if hasattr(checkpointer, 'wait_until_finished'):
+        checkpointer.wait_until_finished()
 
     # Final summary
     print(f"\n{'='*60}")

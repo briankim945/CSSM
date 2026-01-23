@@ -402,9 +402,45 @@ def get_pathfinder_info(
     difficulty: str = '9',
     root: str = '/media/data_cifs_lrs/projects/prj_LRA/PathFinder/pathfinder300_new_2025',
     train_ratio: float = 0.8,
+    tfrecord_dir: str = None,
 ) -> dict:
-    """Get dataset metadata."""
-    # Count actual images
+    """Get dataset metadata.
+
+    Args:
+        difficulty: Pathfinder difficulty level ('9', '14', '20')
+        root: Root directory for PNG files (used if tfrecord_dir is None)
+        train_ratio: Train split ratio (used if counting from PNGs)
+        tfrecord_dir: Path to TFRecord directory (reads metadata.json if available)
+
+    Returns:
+        Dictionary with dataset info including train_size
+    """
+    # Try to read from TFRecord metadata first
+    if tfrecord_dir is not None:
+        tfrecord_path = Path(tfrecord_dir)
+
+        # Try two possible locations for metadata.json:
+        # 1. User passed difficulty dir directly: tfrecord_dir/metadata.json
+        # 2. User passed parent dir: tfrecord_dir/difficulty_{difficulty}/metadata.json
+        metadata_path = tfrecord_path / 'metadata.json'
+        if not metadata_path.exists():
+            metadata_path = tfrecord_path / f'difficulty_{difficulty}' / 'metadata.json'
+
+        if metadata_path.exists():
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            return {
+                'num_classes': 2,
+                'train_size': metadata.get('train_samples', 0),
+                'total_size': metadata.get('total_samples', 0),
+                'image_size': metadata.get('image_size', 224),
+                'difficulty': metadata.get('difficulty', difficulty),
+                'task': 'binary_classification',
+                'description': f'Pathfinder contour length {difficulty} (TFRecord)',
+            }
+
+    # Fall back to counting actual images
     difficulty_dir = os.path.join(root, f'curv_contour_length_{difficulty}', 'imgs')
     n_pos = len(list(Path(difficulty_dir).glob('pos/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'pos')) else 0
     n_neg = len(list(Path(difficulty_dir).glob('neg/*.png'))) if os.path.exists(os.path.join(difficulty_dir, 'neg')) else 0
@@ -437,7 +473,11 @@ class PathfinderTFRecordLoader:
     """
     Fast TFRecord-based data loader for Pathfinder.
 
-    Requires pre-conversion using scripts/convert_pathfinder_to_tfrecord.py
+    Requires pre-conversion using scripts/convert_pathfinder_tfrecords.py
+
+    Supports two directory structures:
+    1. tfrecord_dir/difficulty_{difficulty}/{split}/*.tfrecord (parent dir)
+    2. tfrecord_dir/{split}/*.tfrecord (difficulty dir directly)
     """
 
     def __init__(
@@ -458,15 +498,29 @@ class PathfinderTFRecordLoader:
         self.num_frames = num_frames
         self.shuffle = shuffle
 
-        # Find TFRecord shards
-        shard_dir = Path(tfrecord_dir) / f'difficulty_{difficulty}' / split
+        tfrecord_path = Path(tfrecord_dir)
+
+        # Try two possible directory structures:
+        # 1. User passed parent dir: tfrecord_dir/difficulty_{difficulty}/{split}/
+        # 2. User passed difficulty dir directly: tfrecord_dir/{split}/
+        shard_dir = tfrecord_path / f'difficulty_{difficulty}' / split
+        metadata_path = tfrecord_path / f'difficulty_{difficulty}' / 'metadata.json'
+
+        if not shard_dir.exists():
+            # Try direct path (user passed difficulty dir)
+            shard_dir = tfrecord_path / split
+            metadata_path = tfrecord_path / 'metadata.json'
+
         self.shard_paths = sorted(shard_dir.glob('*.tfrecord'))
 
         if len(self.shard_paths) == 0:
-            raise ValueError(f"No TFRecord shards found in {shard_dir}")
+            raise ValueError(
+                f"No TFRecord shards found in {shard_dir}\n"
+                f"Expected structure: tfrecord_dir/{split}/*.tfrecord\n"
+                f"Or: tfrecord_dir/difficulty_{{difficulty}}/{split}/*.tfrecord"
+            )
 
         # Load metadata for sample count
-        metadata_path = Path(tfrecord_dir) / f'difficulty_{difficulty}' / 'metadata.json'
         if metadata_path.exists():
             import json
             with open(metadata_path) as f:
@@ -501,25 +555,33 @@ class PathfinderTFRecordLoader:
         return image, label
 
     def _create_dataset(self, shuffle_buffer: int, prefetch_batches: int):
-        """Create TF dataset pipeline."""
-        # Interleave shards for better I/O
+        """Create optimized TF dataset pipeline."""
+        # Interleave shards for better I/O parallelism
         files = tf.data.Dataset.from_tensor_slices([str(p) for p in self.shard_paths])
 
         if self.shuffle:
             files = files.shuffle(len(self.shard_paths))
 
+        # Use higher cycle_length for better I/O overlap
+        # TFRecordDataset with buffer_size for read-ahead
         dataset = files.interleave(
-            lambda x: tf.data.TFRecordDataset(x),
-            cycle_length=4,
+            lambda x: tf.data.TFRecordDataset(x, buffer_size=8 * 1024 * 1024),  # 8MB buffer
+            cycle_length=min(8, len(self.shard_paths)),  # More parallel reads
             num_parallel_calls=tf.data.AUTOTUNE,
+            deterministic=False,  # Allow out-of-order for speed
         )
 
         if self.shuffle:
             dataset = dataset.shuffle(shuffle_buffer)
 
-        dataset = dataset.map(self._parse_example, num_parallel_calls=tf.data.AUTOTUNE)
+        # Parse with parallel calls
+        dataset = dataset.map(
+            self._parse_example,
+            num_parallel_calls=tf.data.AUTOTUNE,
+            deterministic=False,
+        )
         dataset = dataset.batch(self.batch_size, drop_remainder=True)
-        dataset = dataset.prefetch(prefetch_batches)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)  # Let TF decide prefetch size
 
         return dataset
 

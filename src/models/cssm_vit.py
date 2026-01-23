@@ -81,28 +81,27 @@ class PatchEmbed(nn.Module):
 
 class ConvStem(nn.Module):
     """
-    Convolutional stem with overlapping receptive fields.
-
-    Preserves much more spatial detail than PatchEmbed.
-    Similar to SHViT/ResNet-style stems.
-
-    For 300×300 Pathfinder → 75×75 output (stride 4 total)
-    For 224×224 ImageNet → 56×56 output (stride 4 total)
+    Simple convolutional stem: Conv → GELU → Norm.
 
     Attributes:
         embed_dim: Output embedding dimension
-        stem_type: 'shvit' (2x conv3x3 s2) or 'resnet' (conv7x7 s2 + pool)
+        stride: Downsampling stride (1, 2, or 4)
+        kernel_size: Conv kernel size (default 3)
+        norm_type: 'layer' (LayerNorm) or 'batch' (BatchNorm)
     """
     embed_dim: int = 384
-    stem_type: str = 'shvit'  # 'shvit' or 'resnet'
+    stride: int = 4
+    kernel_size: int = 3
+    norm_type: str = 'layer'  # 'layer' or 'batch'
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
         """
         Args:
             x: Input tensor (B, T, H, W, 3)
+            training: Training mode (only affects BatchNorm)
         Returns:
-            Features tensor (B, T, H/4, W/4, embed_dim)
+            Features tensor (B, T, H/stride, W/stride, embed_dim)
         """
         # Handle video input: process each frame
         is_video = x.ndim == 5
@@ -110,49 +109,84 @@ class ConvStem(nn.Module):
             B, T, H, W, C = x.shape
             x = x.reshape(B * T, H, W, C)
 
-        if self.stem_type == 'resnet':
-            # ResNet-style: 7×7 conv stride 2 + 3×3 max pool stride 2
-            x = nn.Conv(
-                self.embed_dim // 2,
-                kernel_size=(7, 7),
-                strides=(2, 2),
-                padding='SAME',
-                name='conv1'
-            )(x)
-            x = nn.LayerNorm(name='norm1')(x)
-            x = jax.nn.gelu(x)
-            # Max pool 3×3 stride 2
-            x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding='SAME')
-            # Project to embed_dim
-            x = nn.Conv(
-                self.embed_dim,
-                kernel_size=(1, 1),
-                name='proj'
-            )(x)
-        else:  # 'shvit' style
-            # Two overlapping 3×3 convs with stride 2 each
-            x = nn.Conv(
-                self.embed_dim // 2,
-                kernel_size=(3, 3),
-                strides=(2, 2),
-                padding='SAME',
-                name='conv1'
-            )(x)
-            x = nn.LayerNorm(name='norm1')(x)
-            x = jax.nn.gelu(x)
-            x = nn.Conv(
-                self.embed_dim,
-                kernel_size=(3, 3),
-                strides=(2, 2),
-                padding='SAME',
-                name='conv2'
-            )(x)
-            x = nn.LayerNorm(name='norm2')(x)
+        # Single conv with configurable stride
+        x = nn.Conv(
+            self.embed_dim,
+            kernel_size=(self.kernel_size, self.kernel_size),
+            strides=(self.stride, self.stride),
+            padding='SAME',
+            name='conv'
+        )(x)
+
+        # GELU nonlinearity
+        x = jax.nn.gelu(x)
+
+        # Normalization
+        if self.norm_type == 'batch':
+            x = nn.BatchNorm(use_running_average=not training, name='norm')(x)
+        else:  # 'layer' (default)
+            x = nn.LayerNorm(name='norm')(x)
 
         if is_video:
             x = x.reshape(B, T, x.shape[1], x.shape[2], self.embed_dim)
 
         return x
+
+
+class MultiLayerConvStem(nn.Module):
+    """
+    Multi-layer convolutional stem with configurable strides per layer.
+
+    Each layer: Conv3x3 → LayerNorm → GELU (except last layer has no GELU)
+
+    Examples:
+        strides=(2, 2): Two conv layers, each stride 2 → total stride 4
+        strides=(4,): Single conv layer, stride 4 → total stride 4
+        strides=(2, 2, 2): Three conv layers → total stride 8
+
+    Attributes:
+        embed_dim: Final output dimension
+        strides: Tuple of strides for each layer
+    """
+    embed_dim: int = 384
+    strides: tuple = (2, 2)
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
+        is_video = x.ndim == 5
+        if is_video:
+            B, T, H, W, C = x.shape
+            x = x.reshape(B * T, H, W, C)
+
+        num_layers = len(self.strides)
+
+        for i, stride in enumerate(self.strides):
+            is_last = (i == num_layers - 1)
+
+            # Intermediate layers use embed_dim // 2, last layer uses embed_dim
+            out_dim = self.embed_dim if is_last else self.embed_dim // 2
+
+            x = nn.Conv(
+                out_dim,
+                kernel_size=(3, 3),
+                strides=(stride, stride),
+                padding='SAME',
+                name=f'conv{i+1}'
+            )(x)
+            x = nn.LayerNorm(name=f'norm{i+1}')(x)
+
+            # GELU after all layers except the last
+            if not is_last:
+                x = jax.nn.gelu(x)
+
+        if is_video:
+            x = x.reshape(B, T, x.shape[1], x.shape[2], self.embed_dim)
+
+        return x
+
+
+# Backwards compatibility alias
+LegacyConvStem = MultiLayerConvStem
 
 
 class DWConv(nn.Module):
@@ -249,6 +283,8 @@ class CSSMBlock(nn.Module):
     kernel_size: int = 11  # Spatial kernel size for CSSM
     use_dwconv: bool = False  # DWConv in MLP
     output_act: str = 'none'  # Output activation after CSSM: 'gelu', 'silu', or 'none'
+    readout_state: str = 'xyz'  # Which state(s) for hgru_bi: 'xyz', 'x', 'y', 'z', etc.
+    pre_output_act: str = 'none'  # Activation before output_proj in CSSM: 'gelu', 'silu', or 'none'
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
@@ -271,6 +307,12 @@ class CSSMBlock(nn.Module):
         # GatedOpponentCSSM has concat_xy, others may not
         if hasattr(self.cssm_cls, 'concat_xy'):
             cssm_kwargs['concat_xy'] = self.concat_xy
+        # HGRUBilinearCSSM has readout_state for selecting X/Y/Z output
+        if hasattr(self.cssm_cls, 'readout_state'):
+            cssm_kwargs['readout_state'] = self.readout_state
+        # HGRUBilinearCSSM has pre_output_act for activation before output_proj
+        if hasattr(self.cssm_cls, 'pre_output_act'):
+            cssm_kwargs['pre_output_act'] = self.pre_output_act
 
         x = self.cssm_cls(**cssm_kwargs, name='cssm')(x)
 
@@ -339,7 +381,9 @@ class CSSMViT(nn.Module):
     embed_dim: int = 384
     depth: int = 12
     patch_size: int = 16  # Only used if stem_mode='patch'
-    stem_mode: str = 'conv'  # 'patch', 'conv' (SHViT-style), or 'resnet'
+    stem_mode: str = 'conv'  # 'patch' (ViT-style) or 'conv' (single conv)
+    stem_stride: int = 4  # Downsampling factor for conv stem (1, 2, or 4)
+    stem_norm: str = 'layer'  # 'layer' (LayerNorm) or 'batch' (BatchNorm)
     mlp_ratio: float = 4.0
     drop_path_rate: float = 0.1
     cssm_type: str = 'opponent'
@@ -354,6 +398,14 @@ class CSSMViT(nn.Module):
     use_dwconv: bool = False  # DWConv in MLP
     output_act: str = 'none'  # Output activation after CSSM: 'gelu', 'silu', or 'none'
     layer_scale_init: float = 1e-6  # Layer scale initialization (1e-6 for deep, 1.0 for shallow)
+    readout_state: str = 'xyz'  # Which state(s) for hgru_bi: 'xyz', 'x', 'y', 'z', etc.
+    pre_output_act: str = 'none'  # Activation before output_proj in CSSM: 'gelu', 'silu', or 'none'
+    pooling_mode: str = 'mean'  # Global pooling: 'mean', 'max', or 'logsumexp'
+    readout_act: str = 'gelu'  # Final activation before readout: 'gelu', 'silu', or 'none'
+    legacy_stem: bool = False  # Use multi-layer stem with configurable strides
+    stem_strides: tuple = (2, 2)  # Strides per stem layer (e.g., (2,2) or (4,) or (2,2,2))
+    legacy_readout: bool = False  # Use legacy readout: LayerNorm → GELU → Dense(embed_dim) → pool → Dense
+    legacy_mode: bool = False  # Shortcut for legacy_stem + legacy_readout + logsumexp (backwards compat)
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = True,
@@ -395,27 +447,30 @@ class CSSMViT(nn.Module):
             CSSM = GatedOpponentCSSM
 
         # Stem: convert input to feature maps
-        if self.stem_mode == 'patch':
+        # Check legacy_stem OR legacy_mode for multi-layer stem
+        use_multi_layer_stem = self.legacy_stem or self.legacy_mode
+        if use_multi_layer_stem:
+            # Multi-layer stem with configurable strides
+            # Default (2,2) gives total stride 4, same as single stride=4 conv
+            x = MultiLayerConvStem(
+                embed_dim=self.embed_dim,
+                strides=self.stem_strides,
+                name='stem'
+            )(x, training=training)
+        elif self.stem_mode == 'patch':
             # ViT-style non-overlapping patches (loses fine detail)
             x = PatchEmbed(
                 embed_dim=self.embed_dim,
                 patch_size=self.patch_size,
                 name='stem'
             )(x)  # (B, T, H/patch_size, W/patch_size, embed_dim)
-        elif self.stem_mode == 'resnet':
-            # ResNet-style: 7×7 conv + pool (stride 4 total)
+        else:  # 'conv' (default) - single conv + GELU + Norm
             x = ConvStem(
                 embed_dim=self.embed_dim,
-                stem_type='resnet',
+                stride=self.stem_stride,
+                norm_type=self.stem_norm,
                 name='stem'
-            )(x)  # (B, T, H/4, W/4, embed_dim)
-        else:  # 'conv' (default, SHViT-style)
-            # Overlapping convolutions (stride 4 total, preserves detail)
-            x = ConvStem(
-                embed_dim=self.embed_dim,
-                stem_type='shvit',
-                name='stem'
-            )(x)  # (B, T, H/4, W/4, embed_dim)
+            )(x, training=training)  # (B, T, H/stride, W/stride, embed_dim)
 
         _, _, H_p, W_p, _ = x.shape
 
@@ -447,48 +502,103 @@ class CSSMViT(nn.Module):
                 use_dwconv=self.use_dwconv,
                 output_act=self.output_act,
                 layer_scale_init=self.layer_scale_init,
+                readout_state=self.readout_state,
+                pre_output_act=self.pre_output_act,
                 name=f'block{i}'
             )(x, training=training)
 
-        # Final norm
+        # Check legacy_readout OR legacy_mode for old-style readout
+        use_legacy_readout = self.legacy_readout or self.legacy_mode
+        if use_legacy_readout:
+            # LEGACY READOUT: LayerNorm → GELU → Dense(embed_dim) → pool → Dense(num_classes)
+            x = nn.LayerNorm(name='norm')(x)
+            # x shape: (B, T, H', W', embed_dim)
+
+            if return_spatial:
+                # Apply readout to all timesteps
+                x_all = jax.nn.gelu(x)
+                x_all = nn.Dense(self.embed_dim, name='readout_proj')(x_all)
+
+                # Apply head per-pixel at each timestep
+                head = nn.Dense(self.num_classes, name='head')
+                B, T, Hp, Wp, E = x_all.shape
+                x_flat = x_all.reshape(-1, E)
+                perpixel_logits_flat = head(x_flat)
+                perpixel_logits = perpixel_logits_flat.reshape(B, T, Hp, Wp, self.num_classes)
+
+                # Final logits with configurable pooling
+                x_last = x_all[:, -1]
+                x_pooled_flat = x_last.reshape(x_last.shape[0], -1, self.embed_dim)
+                if self.pooling_mode == 'mean':
+                    x_pooled = x_pooled_flat.mean(axis=1)
+                elif self.pooling_mode == 'max':
+                    x_pooled = x_pooled_flat.max(axis=1)
+                else:  # logsumexp
+                    x_pooled = jax.scipy.special.logsumexp(x_pooled_flat, axis=1)
+                final_logits = head(x_pooled)
+
+                return final_logits, perpixel_logits
+
+            # Standard forward: use last timestep only
+            x = x[:, -1]  # (B, H', W', embed_dim)
+
+            # Readout: GELU + channel projection before pooling
+            x = jax.nn.gelu(x)
+            x = nn.Dense(self.embed_dim, name='readout_proj')(x)  # (B, H', W', embed_dim)
+
+            # Global pooling (configurable, default logsumexp for legacy)
+            x_flat = x.reshape(x.shape[0], -1, self.embed_dim)  # (B, H'*W', embed_dim)
+            if self.pooling_mode == 'mean':
+                x = x_flat.mean(axis=1)
+            elif self.pooling_mode == 'max':
+                x = x_flat.max(axis=1)
+            else:  # logsumexp (legacy default)
+                x = jax.scipy.special.logsumexp(x_flat, axis=1)  # (B, embed_dim)
+
+            # Classification head
+            x = nn.Dense(self.num_classes, name='head')(x)
+
+            return x
+
+        # NEW READOUT: [act] → LayerNorm → Dense(num_classes) → pool
+        if self.readout_act == 'gelu':
+            x = jax.nn.gelu(x)
+        elif self.readout_act == 'silu':
+            x = jax.nn.silu(x)
         x = nn.LayerNorm(name='norm')(x)
         # x shape: (B, T, H', W', embed_dim)
 
         if return_spatial:
             # Return per-pixel logits at ALL timesteps
-            # Apply readout to all timesteps
-            x_all = jax.nn.gelu(x)
-            x_all = nn.Dense(self.embed_dim, name='readout_proj')(x_all)  # (B, T, H', W', embed_dim)
+            # Apply head per-pixel: (B, T, H', W', embed_dim) -> (B, T, H', W', num_classes)
+            perpixel_logits = nn.Dense(self.num_classes, name='head')(x)
 
-            # Apply head per-pixel at each timestep
-            head = nn.Dense(self.num_classes, name='head')
-            # Reshape to apply head: (B*T*H'*W', embed_dim) -> (B*T*H'*W', num_classes)
-            B, T, Hp, Wp, E = x_all.shape
-            x_flat = x_all.reshape(-1, E)
-            perpixel_logits_flat = head(x_flat)
-            perpixel_logits = perpixel_logits_flat.reshape(B, T, Hp, Wp, self.num_classes)
-
-            # Also compute final logits normally (for prediction)
-            x_last = x_all[:, -1]  # (B, H', W', embed_dim)
-            x_pooled_flat = x_last.reshape(x_last.shape[0], -1, self.embed_dim)
-            x_pooled = jax.scipy.special.logsumexp(x_pooled_flat, axis=1)
-            final_logits = head(x_pooled)
+            # Final logits: pool over last timestep spatial dims
+            x_last = perpixel_logits[:, -1]  # (B, H', W', num_classes)
+            x_flat = x_last.reshape(x_last.shape[0], -1, self.num_classes)
+            if self.pooling_mode == 'mean':
+                final_logits = x_flat.mean(axis=1)
+            elif self.pooling_mode == 'max':
+                final_logits = x_flat.max(axis=1)
+            else:  # logsumexp
+                final_logits = jax.scipy.special.logsumexp(x_flat, axis=1)
 
             return final_logits, perpixel_logits
 
         # Standard forward: use last timestep only
         x = x[:, -1]  # (B, H', W', embed_dim) - final timestep
 
-        # Readout: nonlinearity + channel projection before pooling
-        x = jax.nn.gelu(x)
-        x = nn.Dense(self.embed_dim, name='readout_proj')(x)  # (B, H', W', embed_dim)
+        # Per-pixel classification head (fan-in to num_classes)
+        x = nn.Dense(self.num_classes, name='head')(x)  # (B, H', W', num_classes)
 
-        # LogSumExp pooling: smooth max, gradients flow everywhere
-        x_flat = x.reshape(x.shape[0], -1, self.embed_dim)  # (B, H'*W', embed_dim)
-        x = jax.scipy.special.logsumexp(x_flat, axis=1)  # (B, embed_dim)
-
-        # Classification head
-        x = nn.Dense(self.num_classes, name='head')(x)
+        # Global pooling over spatial dims
+        x_flat = x.reshape(x.shape[0], -1, self.num_classes)  # (B, H'*W', num_classes)
+        if self.pooling_mode == 'mean':
+            x = x_flat.mean(axis=1)  # (B, num_classes)
+        elif self.pooling_mode == 'max':
+            x = x_flat.max(axis=1)  # (B, num_classes)
+        else:  # logsumexp (smooth max)
+            x = jax.scipy.special.logsumexp(x_flat, axis=1)  # (B, num_classes)
 
         return x
 

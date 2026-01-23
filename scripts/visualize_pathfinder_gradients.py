@@ -335,7 +335,7 @@ def main():
     parser.add_argument('--seq_len', type=int, default=8)
     parser.add_argument('--cssm', type=str, default='opponent')
     parser.add_argument('--kernel_size', type=int, default=15)
-    parser.add_argument('--use_dwconv', action='store_true', default=True)
+    parser.add_argument('--use_dwconv', action='store_true', default=False)
     parser.add_argument('--output_act', type=str, default='gelu')
     parser.add_argument('--stem_mode', type=str, default='conv')
     parser.add_argument('--no_pos_embed', action='store_true', default=False)
