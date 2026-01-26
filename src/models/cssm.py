@@ -2366,3 +2366,217 @@ class HGRUBilinearCSSM(nn.Module):
             out = out.transpose(0, 1, 3, 4, 2)  # (B, T, H, W, len*C)
             out = self._apply_pre_output_act(out)
             return nn.Dense(C, name='output_proj')(out)
+
+
+class TransformerCSSM(nn.Module):
+    """
+    Minimal transformer-like CSSM with Q, K, A states.
+
+    This is a simplified version of HGRUBilinearCSSM that makes the
+    attention parallel explicit:
+    - Q (Query): like transformer queries, gets modulated by attention
+    - K (Key): like transformer keys, interacts with Q
+    - A (Attention): accumulates Q-K correlation, feeds back into Q
+
+    The key insight: as the receptive field grows over timesteps (via
+    kernel convolutions compounding), A accumulates Q-K interaction
+    across this growing field - similar to iteratively growing attention.
+
+    Dynamics:
+        Q_t = decay_Q·Q + w·K·K + α·K·A + U_Q   (Q sees K and attention)
+        K_t = w·K·Q + decay_K·K + U_K           (K sees Q, symmetric)
+        A_t = γ·Q + γ·K + decay_A·A + U_A       (A accumulates Q+K)
+
+    Key simplifications from HGRUBilinearCSSM:
+    - One spatial kernel (not two K_E/K_I)
+    - Symmetric Q↔K coupling
+    - A is pure memory (no spatial kernel)
+    - ~10 gates instead of 13+
+
+    Attributes:
+        channels: Number of input/output channels
+        kernel_size: Spatial kernel size
+        spectral_rho: Maximum spectral magnitude for stability
+    """
+    channels: int
+    kernel_size: int = 11
+    spectral_rho: float = 0.999
+    rope_mode: str = 'none'
+    rope_base: float = 10000.0
+    readout_state: str = 'qka'  # 'qka', 'q', 'k', 'a', 'qk', 'qa', 'ka'
+    pre_output_act: str = 'none'
+    # Unused but kept for API compatibility
+    gate_activation: str = 'sigmoid'
+    concat_xy: bool = True
+    gate_rank: int = 0
+    dense_mixing: bool = False
+    block_size: int = 1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Forward pass with minimal Q/K/A dynamics.
+
+        Args:
+            x: Input tensor of shape (B, T, H, W, C)
+
+        Returns:
+            Output tensor of shape (B, T, H, W, C)
+        """
+        B, T, H, W, C = x.shape
+        W_freq = W // 2 + 1
+
+        if self.rope_mode != 'none':
+            x = apply_rope(x, mode=self.rope_mode, base=self.rope_base)
+
+        # === SINGLE spatial kernel (simplified from two K_E/K_I) ===
+        k_shape = (C, self.kernel_size, self.kernel_size)
+        k_spatial = self.param('kernel', nn.initializers.xavier_normal(), k_shape)
+
+        pad_h = max(0, (H - self.kernel_size) // 2)
+        pad_w = max(0, (W - self.kernel_size) // 2)
+        pad_h_after = H - self.kernel_size - pad_h
+        pad_w_after = W - self.kernel_size - pad_w
+
+        if self.kernel_size > H or self.kernel_size > W:
+            start_h = (self.kernel_size - H) // 2
+            start_w = (self.kernel_size - W) // 2
+            k_padded = k_spatial[:, start_h:start_h+H, start_w:start_w+W]
+        else:
+            k_padded = jnp.pad(k_spatial, ((0, 0), (pad_h, max(0, pad_h_after)),
+                                           (pad_w, max(0, pad_w_after))), mode='constant')
+
+        K_hat_raw = jnp.fft.rfft2(k_padded, axes=(1, 2))
+        K_hat = _stable_spectral_magnitude(K_hat_raw, rho=self.spectral_rho)
+
+        # === Project input to Q, K, A pathways ===
+        x_flat = x.reshape(B * T, H, W, C)
+        qka_proj = nn.Dense(3 * C, name='input_proj')(x_flat)
+        qka_proj = qka_proj.reshape(B, T, H, W, 3 * C)
+
+        q_input = qka_proj[..., :C]
+        k_input = qka_proj[..., C:2*C]
+        a_input = qka_proj[..., 2*C:]
+
+        # FFT inputs
+        U_Q_hat = jnp.fft.rfft2(q_input.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+        U_K_hat = jnp.fft.rfft2(k_input.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+        U_A_hat = jnp.fft.rfft2(a_input.transpose(0, 1, 4, 2, 3), axes=(3, 4))
+
+        # === Input-dependent gates (MINIMAL set) ===
+        ctx = x.mean(axis=(2, 3))
+        ctx = apply_temporal_rope_to_context(ctx, base=self.rope_base)
+        n_gate = H * W_freq
+
+        # 3 decay gates (bounded 0.1-0.99)
+        decay_Q = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='decay_Q')(ctx)).reshape(B, T, 1, H, W_freq)
+        decay_K = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='decay_K')(ctx)).reshape(B, T, 1, H, W_freq)
+        decay_A = 0.1 + 0.89 * nn.sigmoid(nn.Dense(n_gate, name='decay_A')(ctx)).reshape(B, T, 1, H, W_freq)
+
+        # Q↔K coupling (single weight, symmetric)
+        w_qk = nn.sigmoid(nn.Dense(n_gate, name='w_qk')(ctx)).reshape(B, T, 1, H, W_freq)
+
+        # A→Q feedback (attention application)
+        alpha = nn.sigmoid(nn.Dense(n_gate, name='alpha')(ctx)).reshape(B, T, 1, H, W_freq)
+
+        # A accumulation rate (same for Q and K contribution)
+        gamma = nn.sigmoid(nn.Dense(n_gate, name='gamma')(ctx)).reshape(B, T, 1, H, W_freq)
+
+        # I/O gates
+        B_Q = nn.sigmoid(nn.Dense(n_gate, name='B_Q')(ctx)).reshape(B, T, 1, H, W_freq)
+        B_K = nn.sigmoid(nn.Dense(n_gate, name='B_K')(ctx)).reshape(B, T, 1, H, W_freq)
+        B_A = nn.sigmoid(nn.Dense(n_gate, name='B_A')(ctx)).reshape(B, T, 1, H, W_freq)
+        C_gate = nn.sigmoid(nn.Dense(n_gate, name='C_gate')(ctx)).reshape(B, T, 1, H, W_freq)
+
+        # === Build 3x3 transition matrix ===
+        # [decay_Q    w·K       α·K   ]   Q: sees K and A through kernel
+        # [w·K        decay_K    0    ]   K: sees Q through kernel (symmetric)
+        # [γ          γ        decay_A]   A: pure memory, no kernel
+
+        K_b = K_hat[None, None, ...].astype(jnp.complex64)
+        ones = jnp.ones_like(K_b)
+        zeros = jnp.zeros_like(decay_Q.astype(jnp.complex64) * ones)
+
+        decay_Q_c = decay_Q.astype(jnp.complex64)
+        decay_K_c = decay_K.astype(jnp.complex64)
+        decay_A_c = decay_A.astype(jnp.complex64)
+
+        # Row 0: Q update
+        A_00 = decay_Q_c * ones           # Q self-decay (scalar, no kernel)
+        A_01 = w_qk * K_b                 # K → Q via kernel
+        A_02 = alpha * K_b                # A → Q via kernel (attention application!)
+
+        # Row 1: K update (symmetric with Q)
+        A_10 = w_qk * K_b                 # Q → K via kernel (same weight as K→Q)
+        A_11 = decay_K_c * ones           # K self-decay (scalar)
+        A_12 = zeros                      # No A → K
+
+        # Row 2: A update (pure memory - NO kernel)
+        A_20 = gamma * ones               # Q → A (scalar)
+        A_21 = gamma * ones               # K → A (scalar, same weight)
+        A_22 = decay_A_c * ones           # A self-decay (scalar)
+
+        row0 = jnp.stack([A_00, A_01, A_02], axis=-1)
+        row1 = jnp.stack([A_10, A_11, A_12], axis=-1)
+        row2 = jnp.stack([A_20, A_21, A_22], axis=-1)
+        K_mat = jnp.stack([row0, row1, row2], axis=-2)
+
+        # Apply input gates
+        U_Q_gated = U_Q_hat * B_Q
+        U_K_gated = U_K_hat * B_K
+        U_A_gated = U_A_hat * B_A
+        U_vec = jnp.stack([U_Q_gated, U_K_gated, U_A_gated], axis=-1)
+
+        # === GOOM scan ===
+        from .math import cssm_3x3_matrix_scan_op
+
+        K_log = to_goom(K_mat)
+        U_log = to_goom(U_vec)
+
+        _, State_log = jax.lax.associative_scan(
+            cssm_3x3_matrix_scan_op, (K_log, U_log), axis=1
+        )
+
+        QKA_hat = from_goom(State_log)
+        QKA_hat_gated = QKA_hat * C_gate[..., None]
+
+        # === Output ===
+        state_indices = {'q': [0], 'k': [1], 'a': [2],
+                         'qk': [0, 1], 'qa': [0, 2], 'ka': [1, 2],
+                         'qka': [0, 1, 2]}
+        indices = state_indices.get(self.readout_state, [0, 1, 2])
+
+        if len(indices) == 3:
+            QKA_hat_gated = QKA_hat_gated.transpose(0, 1, 2, 5, 3, 4)
+            QKA_hat_gated = QKA_hat_gated.reshape(B, T, C * 3, H, -1)
+
+            out = jnp.fft.irfft2(QKA_hat_gated, s=(H, W), axes=(3, 4))
+            out = out.transpose(0, 1, 3, 4, 2)
+            if self.pre_output_act == 'gelu':
+                out = jax.nn.gelu(out)
+            elif self.pre_output_act == 'silu':
+                out = jax.nn.silu(out)
+            return nn.Dense(C, name='output_proj')(out)
+        elif len(indices) == 1:
+            idx = indices[0]
+            state_hat = QKA_hat_gated[..., idx]
+            out = jnp.fft.irfft2(state_hat, s=(H, W), axes=(3, 4))
+            out = out.transpose(0, 1, 3, 4, 2)
+            if self.pre_output_act == 'gelu':
+                out = jax.nn.gelu(out)
+            elif self.pre_output_act == 'silu':
+                out = jax.nn.silu(out)
+            return out
+        else:
+            selected = [QKA_hat_gated[..., i] for i in indices]
+            stacked = jnp.stack(selected, axis=-1)
+            stacked = stacked.transpose(0, 1, 2, 5, 3, 4)
+            stacked = stacked.reshape(B, T, C * len(indices), H, -1)
+
+            out = jnp.fft.irfft2(stacked, s=(H, W), axes=(3, 4))
+            out = out.transpose(0, 1, 3, 4, 2)
+            if self.pre_output_act == 'gelu':
+                out = jax.nn.gelu(out)
+            elif self.pre_output_act == 'silu':
+                out = jax.nn.silu(out)
+            return nn.Dense(C, name='output_proj')(out)

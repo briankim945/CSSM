@@ -13,8 +13,17 @@ Training features:
 - Weights & Biases logging
 """
 
-import argparse
+# =============================================================================
+# IMPORTANT: Configure TensorFlow to use CPU-only BEFORE importing it
+# This prevents TensorFlow (used for TFRecord data loading) from conflicting
+# with JAX's NCCL for multi-GPU training.
+# =============================================================================
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF info/warning logs
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Don't preallocate if TF does use GPU
+# =============================================================================
+
+import argparse
 import pickle
 import re
 import time
@@ -125,12 +134,24 @@ class SimpleCheckpointer:
 
         return state
 
-from src.models.convnext import ModelFactory
 from src.models.cssm_vit import CSSMViT, cssm_vit_tiny, cssm_vit_small
 from src.models.baseline_vit import BaselineViT, baseline_vit_tiny, baseline_vit_small
-from src.models.deit3 import DeiT3Large, deit3_large_patch16_384, deit3_base_patch16_224
-from src.models.cssm_deit3 import CSSMDeiT3Large, cssm_deit3_large_patch16_384, cssm_deit3_base_patch16_224
+from src.models.simple_cssm import SimpleCSSM
 from src.data import get_imagenette_video_loader, get_dataset_info, get_imagenet_loader, get_imagenet_info
+
+# =============================================================================
+# Configure TensorFlow to use CPU only BEFORE importing data loaders
+# This prevents TensorFlow from conflicting with JAX's NCCL for multi-GPU
+# =============================================================================
+try:
+    import tensorflow as tf
+    # Hide all GPUs from TensorFlow - it only needs CPU for data loading
+    tf.config.set_visible_devices([], 'GPU')
+except ImportError:
+    pass  # TensorFlow not installed
+except RuntimeError:
+    pass  # Virtual devices already initialized
+
 from src.pathfinder_data import get_pathfinder_loader, get_pathfinder_info, get_pathfinder_tfrecord_loader
 from src.cabc_data import get_cabc_loader, get_cabc_info, get_cabc_tfrecord_loader
 
@@ -524,15 +545,15 @@ def main():
 
     # Architecture selection
     parser.add_argument('--arch', type=str,
-                        choices=['convnext', 'vit', 'baseline', 'deit3', 'cssm_deit3'],
-                        default='convnext',
-                        help='Architecture: convnext, vit (CSSM-ViT), baseline (ViT), deit3, cssm_deit3')
+                        choices=['simple', 'vit', 'baseline'],
+                        default='simple',
+                        help='Architecture: simple (clean CSSM arch), vit (CSSM-ViT), baseline (ViT)')
 
-    # Model configuration (ConvNeXt-style)
-    parser.add_argument('--mode', type=str, choices=['pure', 'hybrid'], default='pure',
-                        help='[convnext] Model mode: pure (CSSM replaces conv) or hybrid')
-    parser.add_argument('--cssm', type=str, choices=['standard', 'gated', 'opponent', 'bilinear', 'linear', 'linear_opponent', 'hgru', 'hgru_bi'], default='opponent',
-                        help='CSSM type: hgru (2x2 linear opponent), hgru_bi (3x3 with Z interaction channel), opponent (2x2 basic), standard, gated')
+    # CSSM configuration
+    parser.add_argument('--cssm', type=str,
+                        choices=['hgru_bi', 'transformer', 'gated', 'kqv', 'standard', 'opponent', 'hgru', 'bilinear'],
+                        default='hgru_bi',
+                        help='CSSM type: hgru_bi, kqv (K*Q gating), transformer, gated, standard, opponent, hgru, bilinear')
     parser.add_argument('--mixing', type=str, choices=['dense', 'depthwise'], default='depthwise',
                         help='Mixing type: dense (multi-head) or depthwise')
     parser.add_argument('--no_concat_xy', action='store_true',
@@ -557,10 +578,6 @@ def main():
     parser.add_argument('--stem_norm', type=str, default='layer',
                         choices=['layer', 'batch'],
                         help='[vit] Stem normalization: layer (LayerNorm) or batch (BatchNorm)')
-    parser.add_argument('--legacy_stem', action='store_true',
-                        help='[vit] Use multi-layer stem (multiple convs with intermediate nonlinearity)')
-    parser.add_argument('--stem_strides', type=str, default='2,2',
-                        help='[vit] Comma-separated strides per stem layer (e.g., "2,2" or "4" or "2,2,2"). Only with --legacy_stem')
     parser.add_argument('--no_pos_embed', action='store_true',
                         help='[vit/baseline] Disable position embeddings')
     parser.add_argument('--num_heads', type=int, default=6,
@@ -597,10 +614,23 @@ def main():
     parser.add_argument('--readout_act', type=str, default='gelu',
                         choices=['none', 'gelu', 'silu'],
                         help='[vit] Final activation before readout (after all blocks, before norm+pool)')
-    parser.add_argument('--legacy_readout', action='store_true',
-                        help='[vit] Use legacy readout: LayerNorm → GELU → Dense(embed_dim) → pool → Dense(num_classes)')
-    parser.add_argument('--legacy', action='store_true',
-                        help='[vit] Shortcut for --legacy_stem --stem_strides 2,2 --legacy_readout --pooling_mode logsumexp')
+
+    # SimpleCSSM-specific arguments
+    parser.add_argument('--frame_readout', type=str, default='last',
+                        choices=['last', 'all'],
+                        help='[simple] Use last frame or all frames for readout')
+    parser.add_argument('--pos_embed', type=str, default='spatiotemporal',
+                        choices=['spatiotemporal', 'temporal', 'learnable', 'none'],
+                        help='[simple] Position embedding type (RoPE modes applied inside CSSM)')
+    parser.add_argument('--act_type', type=str, default='softplus',
+                        choices=['softplus', 'gelu', 'relu'],
+                        help='[simple] Nonlinearity type in stem and readout')
+    parser.add_argument('--pool_type', type=str, default='mean',
+                        choices=['mean', 'max'],
+                        help='[simple] Final spatial/spatiotemporal pooling type')
+    parser.add_argument('--norm_type', type=str, default='layer',
+                        choices=['layer', 'batch'],
+                        help='[simple] Normalization type throughout model')
 
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=8,
@@ -619,6 +649,8 @@ def main():
                         help='Weight decay coefficient')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='Gradient clipping norm')
+    parser.add_argument('--force_multi_gpu', action='store_true',
+                        help='Force multi-GPU even if NCCL test fails')
 
     # Performance optimizations
     parser.add_argument('--bf16', action='store_true',
@@ -631,7 +663,7 @@ def main():
     # Logging and checkpointing
     parser.add_argument('--run_name', type=str, default=None,
                         help='Run name for checkpoints and wandb (default: auto-generated from config)')
-    parser.add_argument('--project', type=str, default='cssm-convnext',
+    parser.add_argument('--project', type=str, default='cssm',
                         help='Wandb project name')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
                         help='Directory to save checkpoints')
@@ -687,20 +719,17 @@ def main():
     if args.xla_flags:
         os.environ['XLA_FLAGS'] = args.xla_flags
 
-    # Parse stem_strides from comma-separated string to tuple of ints
-    stem_strides = tuple(int(s.strip()) for s in args.stem_strides.split(','))
-
     # Generate run name from config (or use provided name)
     if args.run_name:
         run_name = args.run_name
     else:
-        if args.arch == 'vit':
+        if args.arch == 'simple':
+            run_name = f"simple_{args.cssm}_d{args.depth}_e{args.embed_dim}"
+        elif args.arch == 'vit':
             run_name = f"vit_{args.cssm}_d{args.depth}_e{args.embed_dim}"
-        elif args.arch == 'baseline':
+        else:  # baseline
             temporal_str = f"_temp{args.temporal_attn_every}" if not args.no_temporal_attn else "_notime"
             run_name = f"baseline_d{args.depth}_e{args.embed_dim}_h{args.num_heads}{temporal_str}"
-        else:
-            run_name = f"{args.mode}_{args.cssm}_{args.mixing}"
 
         # Add dataset to run name
         if args.dataset == 'pathfinder':
@@ -765,7 +794,22 @@ def main():
     print(f"  Total steps: {total_steps}\n")
 
     # Create model based on architecture
-    if args.arch == 'vit':
+    if args.arch == 'simple':
+        model = SimpleCSSM(
+            num_classes=num_classes,
+            embed_dim=args.embed_dim,
+            depth=args.depth,
+            cssm_type=args.cssm,
+            kernel_size=args.kernel_size,
+            block_size=args.block_size,
+            frame_readout=args.frame_readout,
+            norm_type=args.norm_type,
+            pos_embed=args.pos_embed,
+            act_type=args.act_type,
+            pool_type=args.pool_type,
+            seq_len=args.seq_len,
+        )
+    elif args.arch == 'vit':
         model = CSSMViT(
             num_classes=num_classes,
             embed_dim=args.embed_dim,
@@ -790,12 +834,8 @@ def main():
             pre_output_act=args.pre_output_act,
             pooling_mode=args.pooling_mode,
             readout_act=args.readout_act,
-            legacy_stem=args.legacy_stem,
-            stem_strides=stem_strides,
-            legacy_readout=args.legacy_readout,
-            legacy_mode=args.legacy,
         )
-    elif args.arch == 'baseline':
+    else:  # baseline
         model = BaselineViT(
             num_classes=num_classes,
             embed_dim=args.embed_dim,
@@ -805,36 +845,6 @@ def main():
             use_temporal_attn=not args.no_temporal_attn,
             temporal_attn_every=args.temporal_attn_every,
             use_pos_embed=not args.no_pos_embed,
-        )
-    elif args.arch == 'deit3':
-        model = DeiT3Large(
-            num_classes=num_classes,
-            embed_dim=args.embed_dim,
-            depth=args.depth,
-            num_heads=args.num_heads,
-            patch_size=args.patch_size,
-        )
-    elif args.arch == 'cssm_deit3':
-        model = CSSMDeiT3Large(
-            num_classes=num_classes,
-            embed_dim=args.embed_dim,
-            depth=args.depth,
-            num_heads=args.num_heads,
-            patch_size=args.patch_size,
-            cssm_type=args.cssm,
-            dense_mixing=(args.mixing == 'dense'),
-            concat_xy=not args.no_concat_xy,
-            gate_activation=args.gate_activation,
-            num_timesteps=args.seq_len,
-        )
-    else:
-        model = ModelFactory(
-            mode=args.mode,
-            cssm_type=args.cssm,
-            mixing=args.mixing,
-            num_classes=num_classes,
-            concat_xy=not args.no_concat_xy,
-            gate_activation=args.gate_activation,
         )
 
     # Initialize training state
@@ -934,25 +944,93 @@ def main():
     if use_multi_gpu:
         # Test NCCL with a simple operation first
         print("Testing NCCL collective operations...")
+        nccl_ok = False
         try:
             test_data = jnp.ones((num_devices, 10), dtype=jnp.float32)
             simple_pmean = jax.pmap(lambda x: jax.lax.pmean(x, axis_name='batch'), axis_name='batch')
             result = simple_pmean(test_data)
             jax.block_until_ready(result)
             print(f"NCCL test PASSED: pmean result shape={result.shape}, value={float(result[0, 0]):.4f}")
+            nccl_ok = True
         except Exception as e:
             print(f"NCCL test FAILED: {e}")
-            print("Multi-GPU may not work. Falling back to single GPU...")
-            use_multi_gpu = False
-            devices = [devices[0]]
-            num_devices = 1
+            if args.force_multi_gpu:
+                print("--force_multi_gpu set, continuing with multi-GPU anyway...")
+                nccl_ok = True  # Force it
+            else:
+                print("Multi-GPU may not work. Falling back to single GPU...")
+                print("(Use --force_multi_gpu to bypass this test)")
+                use_multi_gpu = False
+                devices = [devices[0]]
+                num_devices = 1
 
-        if use_multi_gpu:
+        if use_multi_gpu and nccl_ok:
             pmap_train_step = create_pmap_train_step(num_classes, has_batch_stats)
             pmap_eval_step = create_pmap_eval_step(num_classes, has_batch_stats)
             # Replicate state across devices using Flax's jax_utils (matches ImageNet training)
             state = jax_utils.replicate(state)
             print("State replicated across devices")
+
+    # Create data loaders ONCE before training (not each epoch)
+    # The loaders handle shuffling internally on each iteration
+    print("\nCreating data loaders...")
+    if args.dataset == 'pathfinder':
+        if args.tfrecord_dir:
+            train_loader = get_pathfinder_tfrecord_loader(
+                tfrecord_dir=args.tfrecord_dir,
+                difficulty=args.pathfinder_difficulty,
+                batch_size=args.batch_size,
+                num_frames=args.seq_len,
+                split='train',
+                shuffle=True,
+                prefetch_batches=args.prefetch_batches,
+            )
+        else:
+            train_loader = get_pathfinder_loader(
+                root=args.data_dir,
+                difficulty=args.pathfinder_difficulty,
+                batch_size=args.batch_size,
+                num_frames=args.seq_len,
+                split='train',
+                num_workers=args.num_workers,
+                prefetch_batches=args.prefetch_batches,
+            )
+    elif args.dataset == 'cabc':
+        if args.tfrecord_dir:
+            train_loader = get_cabc_tfrecord_loader(
+                tfrecord_dir=args.tfrecord_dir,
+                difficulty=args.cabc_difficulty,
+                batch_size=args.batch_size,
+                num_frames=args.seq_len,
+                split='train',
+                shuffle=True,
+                prefetch_batches=args.prefetch_batches,
+            )
+        else:
+            train_loader = get_cabc_loader(
+                root=args.data_dir,
+                difficulty=args.cabc_difficulty,
+                batch_size=args.batch_size,
+                num_frames=args.seq_len,
+                split='train',
+                num_workers=args.num_workers,
+                prefetch_batches=args.prefetch_batches,
+            )
+    elif args.dataset == 'imagenet':
+        train_loader = get_imagenet_loader(
+            data_dir=args.imagenet_dir,
+            split='train',
+            batch_size=args.batch_size,
+            image_size=args.image_size,
+            sequence_length=args.seq_len,
+        )
+    else:
+        train_loader = get_imagenette_video_loader(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            sequence_length=args.seq_len,
+            split='train',
+        )
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
@@ -963,66 +1041,6 @@ def main():
             pass  # Don't modify epoch during training - it's just for logging
         else:
             state = state.replace(epoch=jnp.array(epoch))
-
-        # Create fresh data loaders each epoch
-        if args.dataset == 'pathfinder':
-            if args.tfrecord_dir:
-                # Use TFRecord loader for max I/O performance
-                train_loader = get_pathfinder_tfrecord_loader(
-                    tfrecord_dir=args.tfrecord_dir,
-                    difficulty=args.pathfinder_difficulty,
-                    batch_size=args.batch_size,
-                    num_frames=args.seq_len,
-                    split='train',
-                    shuffle=True,
-                    prefetch_batches=args.prefetch_batches,
-                )
-            else:
-                train_loader = get_pathfinder_loader(
-                    root=args.data_dir,
-                    difficulty=args.pathfinder_difficulty,
-                    batch_size=args.batch_size,
-                    num_frames=args.seq_len,
-                    split='train',
-                    num_workers=args.num_workers,
-                    prefetch_batches=args.prefetch_batches,
-                )
-        elif args.dataset == 'cabc':
-            if args.tfrecord_dir:
-                train_loader = get_cabc_tfrecord_loader(
-                    tfrecord_dir=args.tfrecord_dir,
-                    difficulty=args.cabc_difficulty,
-                    batch_size=args.batch_size,
-                    num_frames=args.seq_len,
-                    split='train',
-                    shuffle=True,
-                    prefetch_batches=args.prefetch_batches,
-                )
-            else:
-                train_loader = get_cabc_loader(
-                    root=args.data_dir,
-                    difficulty=args.cabc_difficulty,
-                    batch_size=args.batch_size,
-                    num_frames=args.seq_len,
-                    split='train',
-                    num_workers=args.num_workers,
-                    prefetch_batches=args.prefetch_batches,
-                )
-        elif args.dataset == 'imagenet':
-            train_loader = get_imagenet_loader(
-                data_dir=args.imagenet_dir,
-                split='train',
-                batch_size=args.batch_size,
-                image_size=args.image_size,
-                sequence_length=args.seq_len,
-            )
-        else:
-            train_loader = get_imagenette_video_loader(
-                data_dir=args.data_dir,
-                batch_size=args.batch_size,
-                sequence_length=args.seq_len,
-                split='train',
-            )
 
         # Training
         epoch_loss = 0.0

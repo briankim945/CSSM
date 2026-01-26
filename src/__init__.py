@@ -1,11 +1,11 @@
-"""CSSM ConvNeXt: Cepstral State Space Models with ConvNeXt architecture."""
+"""CSSM: Cepstral State Space Models for vision tasks."""
 
 from .data import get_imagenette_video_loader
-from .models import StandardCSSM, GatedOpponentCSSM, ModelFactory
+from .models import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM
 
 __all__ = [
     "get_imagenette_video_loader",
-    "StandardCSSM",
-    "GatedOpponentCSSM",
-    "ModelFactory",
+    "GatedCSSM",
+    "HGRUBilinearCSSM",
+    "TransformerCSSM",
 ]

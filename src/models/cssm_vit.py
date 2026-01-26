@@ -22,10 +22,7 @@ import numpy as np
 from flax import linen as nn
 from typing import Type, Optional, Tuple
 
-from .cssm import (
-    StandardCSSM, GatedCSSM, GatedOpponentCSSM, BilinearOpponentCSSM,
-    LinearCSSM, LinearOpponentCSSM, HGRUStyleCSSM, HGRUBilinearCSSM
-)
+from .cssm import GatedCSSM, HGRUBilinearCSSM, TransformerCSSM
 
 
 class DropPath(nn.Module):
@@ -402,10 +399,6 @@ class CSSMViT(nn.Module):
     pre_output_act: str = 'none'  # Activation before output_proj in CSSM: 'gelu', 'silu', or 'none'
     pooling_mode: str = 'mean'  # Global pooling: 'mean', 'max', or 'logsumexp'
     readout_act: str = 'gelu'  # Final activation before readout: 'gelu', 'silu', or 'none'
-    legacy_stem: bool = False  # Use multi-layer stem with configurable strides
-    stem_strides: tuple = (2, 2)  # Strides per stem layer (e.g., (2,2) or (4,) or (2,2,2))
-    legacy_readout: bool = False  # Use legacy readout: LayerNorm → GELU → Dense(embed_dim) → pool → Dense
-    legacy_mode: bool = False  # Shortcut for legacy_stem + legacy_readout + logsumexp (backwards compat)
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = True,
@@ -425,39 +418,15 @@ class CSSMViT(nn.Module):
         B, T, H, W, C = x.shape
 
         # Select CSSM class
-        if self.cssm_type == 'standard':
-            CSSM = StandardCSSM
-        elif self.cssm_type == 'gated':
+        if self.cssm_type == 'gated':
             CSSM = GatedCSSM
-        elif self.cssm_type == 'bilinear':
-            CSSM = BilinearOpponentCSSM
-        elif self.cssm_type == 'linear':
-            # Ablation: vanilla CSSM without log-space (sequential scan)
-            CSSM = LinearCSSM
-        elif self.cssm_type == 'linear_opponent':
-            # Ablation: opponent CSSM without log-space (sequential scan)
-            CSSM = LinearOpponentCSSM
-        elif self.cssm_type == 'hgru':
-            # 2x2 linear opponent: X↔Y with separate coupling gates
-            CSSM = HGRUStyleCSSM
-        elif self.cssm_type == 'hgru_bi':
-            # 3x3 with Z interaction channel: X, Y, Z where Z learns X-Y correlation
+        elif self.cssm_type == 'transformer':
+            CSSM = TransformerCSSM
+        else:  # hgru_bi (default)
             CSSM = HGRUBilinearCSSM
-        else:
-            CSSM = GatedOpponentCSSM
 
         # Stem: convert input to feature maps
-        # Check legacy_stem OR legacy_mode for multi-layer stem
-        use_multi_layer_stem = self.legacy_stem or self.legacy_mode
-        if use_multi_layer_stem:
-            # Multi-layer stem with configurable strides
-            # Default (2,2) gives total stride 4, same as single stride=4 conv
-            x = MultiLayerConvStem(
-                embed_dim=self.embed_dim,
-                strides=self.stem_strides,
-                name='stem'
-            )(x, training=training)
-        elif self.stem_mode == 'patch':
+        if self.stem_mode == 'patch':
             # ViT-style non-overlapping patches (loses fine detail)
             x = PatchEmbed(
                 embed_dim=self.embed_dim,
@@ -507,60 +476,7 @@ class CSSMViT(nn.Module):
                 name=f'block{i}'
             )(x, training=training)
 
-        # Check legacy_readout OR legacy_mode for old-style readout
-        use_legacy_readout = self.legacy_readout or self.legacy_mode
-        if use_legacy_readout:
-            # LEGACY READOUT: LayerNorm → GELU → Dense(embed_dim) → pool → Dense(num_classes)
-            x = nn.LayerNorm(name='norm')(x)
-            # x shape: (B, T, H', W', embed_dim)
-
-            if return_spatial:
-                # Apply readout to all timesteps
-                x_all = jax.nn.gelu(x)
-                x_all = nn.Dense(self.embed_dim, name='readout_proj')(x_all)
-
-                # Apply head per-pixel at each timestep
-                head = nn.Dense(self.num_classes, name='head')
-                B, T, Hp, Wp, E = x_all.shape
-                x_flat = x_all.reshape(-1, E)
-                perpixel_logits_flat = head(x_flat)
-                perpixel_logits = perpixel_logits_flat.reshape(B, T, Hp, Wp, self.num_classes)
-
-                # Final logits with configurable pooling
-                x_last = x_all[:, -1]
-                x_pooled_flat = x_last.reshape(x_last.shape[0], -1, self.embed_dim)
-                if self.pooling_mode == 'mean':
-                    x_pooled = x_pooled_flat.mean(axis=1)
-                elif self.pooling_mode == 'max':
-                    x_pooled = x_pooled_flat.max(axis=1)
-                else:  # logsumexp
-                    x_pooled = jax.scipy.special.logsumexp(x_pooled_flat, axis=1)
-                final_logits = head(x_pooled)
-
-                return final_logits, perpixel_logits
-
-            # Standard forward: use last timestep only
-            x = x[:, -1]  # (B, H', W', embed_dim)
-
-            # Readout: GELU + channel projection before pooling
-            x = jax.nn.gelu(x)
-            x = nn.Dense(self.embed_dim, name='readout_proj')(x)  # (B, H', W', embed_dim)
-
-            # Global pooling (configurable, default logsumexp for legacy)
-            x_flat = x.reshape(x.shape[0], -1, self.embed_dim)  # (B, H'*W', embed_dim)
-            if self.pooling_mode == 'mean':
-                x = x_flat.mean(axis=1)
-            elif self.pooling_mode == 'max':
-                x = x_flat.max(axis=1)
-            else:  # logsumexp (legacy default)
-                x = jax.scipy.special.logsumexp(x_flat, axis=1)  # (B, embed_dim)
-
-            # Classification head
-            x = nn.Dense(self.num_classes, name='head')(x)
-
-            return x
-
-        # NEW READOUT: [act] → LayerNorm → Dense(num_classes) → pool
+        # Readout: [act] → LayerNorm → Dense(num_classes) → pool
         if self.readout_act == 'gelu':
             x = jax.nn.gelu(x)
         elif self.readout_act == 'silu':

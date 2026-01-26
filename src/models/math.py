@@ -532,3 +532,209 @@ def make_hgru_scan_op(K_inhib_bilinear: jnp.ndarray, K_excit_bilinear: jnp.ndarr
     def scan_op(carry_i, carry_j):
         return cssm_hgru_scan_op(carry_i, carry_j, K_inhib_bilinear, K_excit_bilinear)
     return scan_op
+
+
+# =============================================================================
+# KQV-CSSM: Transformer-inspired K*Q bilinear gating
+# =============================================================================
+# State: [K, Q, V] where:
+#   K = Key state (accumulates spatial features via conv)
+#   Q = Query state (accumulates spatial features via conv)
+#   V = Value state (receives input GATED by K*Q product)
+#
+# Key insight: K*Q (Hadamard product) gates input flow to V, similar to
+# how attention = softmax(Q @ K^T) @ V gates value contribution.
+# The bilinear K*Q term is added to the INPUT accumulation (u), not the
+# transition matrix, which preserves associativity.
+
+def cssm_kqv_scan_op(
+    carry_i: Tuple[jnp.ndarray, jnp.ndarray],
+    carry_j: Tuple[jnp.ndarray, jnp.ndarray]
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Associative operator for KQV-CSSM with K*Q bilinear gating.
+
+    ============================================================================
+    WHAT THIS COMPUTES (3-State with Bilinear Gating)
+    ============================================================================
+
+    State: [K, Q, V] where V receives input gated by K*Q.
+
+    Dynamics in linear space:
+        K_t = decay_K * conv(K_{t-1}, W_K) + B_K * U
+        Q_t = decay_Q * conv(Q_{t-1}, W_Q) + B_Q * U
+        V_t = decay_V * conv(V_{t-1}, W_V) + (K_{t-1} * Q_{t-1}) * B_V * U
+
+    K and Q evolve independently via diagonal transitions.
+    V receives bilinear K*Q gating on its input term.
+
+    ============================================================================
+    WHY THIS IS ASSOCIATIVE
+    ============================================================================
+
+    The bilinear term K*Q is added to the INPUT accumulation (u_j), not the
+    transition matrix (K_j). Since u_i contains previously accumulated states,
+    the operation:
+        u_new = K_j @ u_i + u_j + bilinear_term_from_u_i
+    is associative.
+
+    ============================================================================
+    LOG-SPACE COMPUTATION
+    ============================================================================
+
+    In GOOM log-space:
+        log(K * Q) = log(K) + log(Q)  (no clipping - let gradients flow)
+
+    The gated V input becomes:
+        gated_input = log_K + log_Q + log_B_V + log_U_V
+
+    ============================================================================
+
+    Args:
+        carry_i: Tuple of (K_matrix_log, u_vector_log) for earlier positions
+                 K has shape (..., 3, 3), u has shape (..., 3)
+        carry_j: Tuple of (K_matrix_log, u_vector_log) for later positions
+
+    Returns:
+        Combined carry: (K_new, u_new)
+    """
+    K_i, u_i = carry_i
+    K_j, u_j = carry_j
+
+    # =========================================================================
+    # STEP 1: Compose 3x3 transition matrices (diagonal for K/Q/V)
+    # =========================================================================
+    K_new = log_matmul_3x3(K_j, K_i)
+
+    # =========================================================================
+    # STEP 2: Propagate accumulated inputs through later transitions
+    # =========================================================================
+    Ku_i = log_matvec_3x3(K_j, u_i)
+
+    # =========================================================================
+    # STEP 3: K and Q - standard linear accumulation
+    # =========================================================================
+    u_new_K = log_add_exp(Ku_i[..., 0], u_j[..., 0])
+    u_new_Q = log_add_exp(Ku_i[..., 1], u_j[..., 1])
+
+    # =========================================================================
+    # STEP 4: BILINEAR GATING - V input gated by K*Q
+    # =========================================================================
+    # In log-space: log(K * Q) = log(K) + log(Q)
+    log_K = u_i[..., 0]  # log(K accumulated)
+    log_Q = u_i[..., 1]  # log(Q accumulated)
+    log_KQ = log_K + log_Q  # K*Q in log-space (no clipping for gradient flow)
+
+    # V accumulates: linear_V + (K*Q) * U_V
+    # The K*Q term gates the input to V (u_j[..., 2])
+    gated_input = log_KQ + u_j[..., 2]
+    u_new_V = log_add_exp(Ku_i[..., 2], gated_input)
+
+    u_new = jnp.stack([u_new_K, u_new_Q, u_new_V], axis=-1)
+    return K_new, u_new
+
+
+def cssm_kqv_block_scan_op(
+    carry_i: Tuple[jnp.ndarray, jnp.ndarray],
+    carry_j: Tuple[jnp.ndarray, jnp.ndarray],
+    block_size: int
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Associative operator for KQV-CSSM with block-diagonal channel mixing.
+
+    ============================================================================
+    BLOCK-DIAGONAL CHANNEL MIXING (Multi-Head Analogy)
+    ============================================================================
+
+    Channels are grouped into blocks of size `block_size`:
+    - num_heads = C / block_size (like attention heads)
+    - Within each block, channels can mix during recurrence
+    - Blocks operate independently (like parallel attention heads)
+
+    State vector per block: [K_1, ..., K_d, Q_1, ..., Q_d, V_1, ..., V_d]
+    where d = block_size.
+
+    Transition matrix per block: (3d x 3d) with structure:
+        [K_block    0          0        ]
+        [0          Q_block    0        ]
+        [0          0          V_block  ]
+
+    Each *_block is (d x d), allowing channel mixing within K, Q, V separately.
+
+    ============================================================================
+    BILINEAR GATING WITH BLOCKS
+    ============================================================================
+
+    The K*Q gating is computed per-channel within each block:
+        gate[c] = K[c] * Q[c]  for c in block
+
+    This gates the corresponding V[c] input. No cross-channel gating.
+
+    ============================================================================
+
+    Args:
+        carry_i: Tuple of (K_matrix_log, u_vector_log) for earlier positions
+                 K has shape (..., num_blocks, 3*block_size, 3*block_size)
+                 u has shape (..., num_blocks, 3*block_size)
+        carry_j: Tuple of (K_matrix_log, u_vector_log) for later positions
+        block_size: Number of channels per block (d)
+
+    Returns:
+        Combined carry: (K_new, u_new)
+    """
+    K_i, u_i = carry_i
+    K_j, u_j = carry_j
+    d = block_size
+
+    # =========================================================================
+    # STEP 1: Block matrix multiplication for transition composition
+    # =========================================================================
+    # K_new = K_j @ K_i per block (using log-space matmul)
+    K_new = log_matmul_block(K_j, K_i, 3 * d)
+
+    # =========================================================================
+    # STEP 2: Block matrix-vector for state propagation
+    # =========================================================================
+    Ku_i = log_matvec_block(K_j, u_i, 3 * d)
+
+    # =========================================================================
+    # STEP 3: Standard accumulation for K and Q portions
+    # =========================================================================
+    # K channels: indices 0 to d-1
+    # Q channels: indices d to 2d-1
+    # V channels: indices 2d to 3d-1
+    u_new_KQ = log_add_exp(Ku_i[..., :2*d], u_j[..., :2*d])
+
+    # =========================================================================
+    # STEP 4: Bilinear gating for V portion
+    # =========================================================================
+    # Per-channel K*Q gating within each block
+    log_K = u_i[..., :d]       # K channels from earlier accumulation
+    log_Q = u_i[..., d:2*d]    # Q channels from earlier accumulation
+    log_KQ = log_K + log_Q     # Per-channel K*Q gate
+
+    # Gate the V input and accumulate
+    gated_V_input = log_KQ + u_j[..., 2*d:]
+    u_new_V = log_add_exp(Ku_i[..., 2*d:], gated_V_input)
+
+    u_new = jnp.concatenate([u_new_KQ, u_new_V], axis=-1)
+    return K_new, u_new
+
+
+def make_kqv_block_scan_op(block_size: int):
+    """
+    Create a KQV block scan operator with fixed block_size.
+
+    JAX's associative_scan requires a binary operator, but cssm_kqv_block_scan_op
+    has an extra block_size parameter. This factory creates a closure with
+    block_size baked in.
+
+    Args:
+        block_size: Number of channels per block
+
+    Returns:
+        Binary scan operator suitable for jax.lax.associative_scan
+    """
+    def scan_op(carry_i, carry_j):
+        return cssm_kqv_block_scan_op(carry_i, carry_j, block_size)
+    return scan_op
