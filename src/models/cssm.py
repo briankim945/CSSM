@@ -2539,6 +2539,7 @@ class TransformerCSSM(nn.Module):
     readout_state: str = 'qka'  # 'qka', 'q', 'k', 'a', 'qk', 'qa', 'ka'
     pre_output_act: str = 'none'
     position_independent_gates: bool = False  # Compute gates from raw input for length generalization
+    use_goom: bool = True  # Use GOOM (log-space) for numerical stability; False uses linear-space scan
     # Unused but kept for API compatibility
     gate_activation: str = 'sigmoid'
     concat_xy: bool = True
@@ -2668,17 +2669,36 @@ class TransformerCSSM(nn.Module):
         U_A_gated = U_A_hat * B_A
         U_vec = jnp.stack([U_Q_gated, U_K_gated, U_A_gated], axis=-1)
 
-        # === GOOM scan ===
-        from .math import cssm_3x3_matrix_scan_op
+        # === Associative scan ===
+        if self.use_goom:
+            # GOOM (log-space) scan for numerical stability
+            from .math import cssm_3x3_matrix_scan_op
 
-        K_log = to_goom(K_mat)
-        U_log = to_goom(U_vec)
+            K_log = to_goom(K_mat)
+            U_log = to_goom(U_vec)
 
-        _, State_log = jax.lax.associative_scan(
-            cssm_3x3_matrix_scan_op, (K_log, U_log), axis=1
-        )
+            _, State_log = jax.lax.associative_scan(
+                cssm_3x3_matrix_scan_op, (K_log, U_log), axis=1
+            )
 
-        QKA_hat = from_goom(State_log)
+            QKA_hat = from_goom(State_log)
+        else:
+            # Linear-space scan (no GOOM) - may have numerical issues for long sequences
+            def linear_scan_op(carry_i, carry_j):
+                """Linear-space 3x3 matrix scan operator."""
+                K_i, u_i = carry_i
+                K_j, u_j = carry_j
+                # K_new = K_j @ K_i (3x3 matmul at each spatial position)
+                K_new = jnp.einsum('...ik,...kj->...ij', K_j, K_i)
+                # u_new = K_j @ u_i + u_j (3x3 matvec + add)
+                Ku_i = jnp.einsum('...ik,...k->...i', K_j, u_i)
+                u_new = Ku_i + u_j
+                return K_new, u_new
+
+            _, QKA_hat = jax.lax.associative_scan(
+                linear_scan_op, (K_mat, U_vec), axis=1
+            )
+
         QKA_hat_gated = QKA_hat * C_gate[..., None]
 
         # === Output ===

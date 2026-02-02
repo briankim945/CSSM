@@ -595,6 +595,8 @@ def main():
                         help='[vit] Spatial kernel size for CSSM excitation/inhibition kernels (11=original, 15=larger RF)')
     parser.add_argument('--position_independent_gates', action='store_true',
                         help='[cssm] Compute gates from raw input (before position encoding) for better length generalization')
+    parser.add_argument('--no_goom', action='store_true',
+                        help='[cssm] Disable GOOM (log-space) scan; use linear-space instead (may have numerical issues)')
     parser.add_argument('--use_dwconv', action='store_true',
                         help='[vit] Use DWConv in MLP (adds params, matches SHViT)')
     parser.add_argument('--output_act', type=str, default='none',
